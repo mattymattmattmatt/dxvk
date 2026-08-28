@@ -6,8 +6,11 @@
 
 #include "openvr.h"
 #include "d3d9_vr.h"
+#include "L4D2VR/game.h"
+#include "L4D2VR/vr.h"
 
 #include <algorithm>
+#include <Windows.h>
 
 namespace dxvk {
 
@@ -242,22 +245,20 @@ namespace dxvk {
           IDirect3DDevice9**     ppReturnedDeviceInterface) {
     
 	vr::HmdError error = vr::VRInitError_None;
-    vr::IVRSystem* system = vr::VR_Init(&error, vr::VRApplication_Scene);
+    vr::IVRSystem* system = vr::VRSystem();
+    if (!system)
+        system = vr::VR_Init(&error, vr::VRApplication_Scene);
 
-    if (error == vr::VRInitError_None) 
+    if (error == vr::VRInitError_None && system)
     {
-        // Override viewport size
-        uint32_t renderWidth, renderHeight;
-        system->GetRecommendedRenderTargetSize(&renderWidth, &renderHeight);
-        pPresentationParameters->BackBufferWidth = renderWidth;
-        pPresentationParameters->BackBufferHeight = renderHeight;
+        // Do NOT resize the D3D backbuffer to the HMD recommended size.
+        // SDK 2007 crashes in client.dll when the swapchain is 2496x2688
+        // while the window is 1280x720.
+        GESVR_ClaimSteamVRScene();
     }
     else
     {
-        char errorString[256];
-        snprintf(errorString, 256, "VR_Init failed: %s", vr::VR_GetVRInitErrorAsEnglishDescription(error));
-        MessageBox(0, errorString, "DXVK", MB_ICONERROR | MB_OK);
-        ExitProcess(0);
+        Game::logMsg("VR_Init failed: %s (no popup)", vr::VR_GetVRInitErrorAsEnglishDescription(error));
     }
 	
 	auto result = this->CreateDeviceEx(
@@ -269,7 +270,13 @@ namespace dxvk {
         nullptr, // <-- pFullscreenDisplayMode
         reinterpret_cast<IDirect3DDevice9Ex**>(ppReturnedDeviceInterface));
 	  
-	Direct3DCreateVRImpl(*ppReturnedDeviceInterface, &g_D3DVR9);
+	if (SUCCEEDED(result) && ppReturnedDeviceInterface && *ppReturnedDeviceInterface)
+	{
+		Direct3DCreateVRImpl(*ppReturnedDeviceInterface, &g_D3DVR9);
+		// Do not Submit/BringToFront here. That races the later Present path
+		// and is a compositor deadlock. Menu uses an overlay; in-game Submit
+		// happens from VR::Update after CViewRender has WaitGetPoses'd.
+	}
 	  
 	return result;
   }

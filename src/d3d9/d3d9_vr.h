@@ -33,6 +33,17 @@ IDirect3DVR9 : public IUnknown{
   virtual HRESULT STDMETHODCALLTYPE UnlockDevice() = 0;
   virtual HRESULT STDMETHODCALLTYPE WaitDeviceIdle() = 0;
   virtual HRESULT STDMETHODCALLTYPE GetBackBufferData(SharedTextureHolder *backBufferData) = 0;
+  virtual IDirect3DDevice9 *STDMETHODCALLTYPE GetD3DDevice() = 0;
+  // Copy (optionally cropped) backbuffer into a persistent left/right eye RT
+  // and fill OpenVR vulkan texture info. eye: 0 = left, 1 = right.
+  virtual HRESULT STDMETHODCALLTYPE CaptureEye(int eye, const RECT *srcRect, SharedTextureHolder *outTexture) = 0;
+  // Copy the current D3D render target (what the engine just drew) into an eye RT.
+  virtual HRESULT STDMETHODCALLTYPE CaptureCurrentRT(int eye, SharedTextureHolder *outTexture) = 0;
+  // Copy the backbuffer into a surface that is NEVER submitted as a compositor eye.
+  virtual HRESULT STDMETHODCALLTYPE CaptureForOverlay(SharedTextureHolder *outTexture, int cursorX, int cursorY) = 0;
+  virtual HRESULT STDMETHODCALLTYPE BlitEyesSBS(SharedTextureHolder *outTexture) = 0;
+  virtual HRESULT STDMETHODCALLTYPE GetBlackTexture(SharedTextureHolder *outTexture) = 0;
+  virtual HRESULT STDMETHODCALLTYPE BlitEyesToBackbufferSBS() = 0;
 };
 
 #ifdef _MSC_VER

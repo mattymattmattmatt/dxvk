@@ -359,12 +359,6 @@ namespace dxvk {
 
 
   HRESULT STDMETHODCALLTYPE D3D9DeviceEx::Reset(D3DPRESENT_PARAMETERS* pPresentationParameters) {
-    if (g_Game && g_Game->m_VR)
-    {
-        pPresentationParameters->BackBufferWidth = g_Game->m_VR->m_RenderWidth;
-        pPresentationParameters->BackBufferHeight = g_Game->m_VR->m_RenderHeight;
-    }
-
     D3D9DeviceLock lock = LockDevice();
 
     HRESULT hr = ResetSwapChain(pPresentationParameters, nullptr);
@@ -1656,15 +1650,6 @@ namespace dxvk {
 
 
   HRESULT STDMETHODCALLTYPE D3D9DeviceEx::SetViewport(const D3DVIEWPORT9* pViewport) {
-    
-     // TODO: Overriding the viewport in-game will mess up the shadows, so only do it in the menu for now.
-    if (g_Game && !g_Game->m_EngineClient->IsInGame())
-    {
-        D3DVIEWPORT9 *newViewport = const_cast<D3DVIEWPORT9 *>(pViewport);
-        newViewport->Width = g_Game->m_VR->m_RenderWidth;
-        newViewport->Height = g_Game->m_VR->m_RenderHeight;
-    }
-      
     D3D9DeviceLock lock = LockDevice();
 
     if (unlikely(ShouldRecord()))
@@ -3514,20 +3499,23 @@ namespace dxvk {
     const RGNDATA* pDirtyRegion,
           DWORD dwFlags) {
     
+	// Capture overlay/eyes BEFORE the swap so the backbuffer still has this
+	// frame. Do not WaitGetPoses or compositor-Submit inside this call —
+	// that deadlocks DXVK Present against SteamVR after a handful of frames
+	// (overlay frozen on the title, no menu items).
+    if (g_Game && g_Game->m_VR && g_Game->m_VR->m_IsInitialized)
+        g_Game->m_VR->Update();
+
 	HRESULT result = m_implicitSwapchain->Present(
     pSourceRect,
     pDestRect,
     hDestWindowOverride,
     pDirtyRegion,
     dwFlags);
-	  
-	g_D3DVR9->WaitDeviceIdle();
-    
-    if (g_Game && g_Game->m_VR)
-    {
-        g_Game->m_VR->Update();
-    }
-	  
+
+    if (g_Game && g_Game->m_VR && g_Game->m_VR->m_IsInitialized)
+        g_Game->m_VR->AfterPresent();
+
 	return result;
   }
 
