@@ -44,6 +44,13 @@ IDirect3DVR9 : public IUnknown{
   virtual HRESULT STDMETHODCALLTYPE BlitEyesSBS(SharedTextureHolder *outTexture) = 0;
   virtual HRESULT STDMETHODCALLTYPE GetBlackTexture(SharedTextureHolder *outTexture) = 0;
   virtual HRESULT STDMETHODCALLTYPE BlitEyesToBackbufferSBS() = 0;
+  // Vulkan queues may only be touched by one thread at a time. DXVK submits
+  // from its own submission thread, so OpenVR's Submit() -- which does a
+  // vkQueueSubmit on the SAME queue -- must be bracketed by these or the two
+  // race. The symptom is a submission fence that never signals and
+  // DxvkDevice::waitForSubmission blocking forever inside Present.
+  virtual HRESULT STDMETHODCALLTYPE LockSubmission() = 0;
+  virtual HRESULT STDMETHODCALLTYPE UnlockSubmission() = 0;
 };
 
 #ifdef _MSC_VER

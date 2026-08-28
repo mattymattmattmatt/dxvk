@@ -117,6 +117,23 @@ namespace dxvk {
             return D3D_OK;
         }
 
+        // Bracket external (OpenVR) queue submissions. DxvkDevice documents
+        // this as the mechanism external libraries must use, because Vulkan
+        // queues are single-threaded-access only. Without it, OpenVR's
+        // vkQueueSubmit races DXVK's submission thread and Present hangs in
+        // DxvkDevice::waitForSubmission.
+        HRESULT STDMETHODCALLTYPE LockSubmission()
+        {
+            m_device->GetDXVKDevice()->lockSubmission();
+            return D3D_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE UnlockSubmission()
+        {
+            m_device->GetDXVKDevice()->unlockSubmission();
+            return D3D_OK;
+        }
+
         HRESULT STDMETHODCALLTYPE WaitDeviceIdle()
         {
             m_device->Flush();
