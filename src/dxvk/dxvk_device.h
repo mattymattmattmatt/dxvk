@@ -429,6 +429,25 @@ namespace dxvk {
     }
 
     /**
+     * rief Locks ONLY the Vulkan queue mutex
+     *
+     * Same mutual exclusion as lockSubmission(), but WITHOUT the
+     * m_submissionQueue.synchronize() drain it performs first. That drain
+     * waits for every pending submission to retire, which deadlocks when
+     * called from inside D3D9DeviceEx::Present: the presentation just
+     * issued is still in flight and cannot retire while Present sits on
+     * the stack waiting for it. Serialising queue access is all an
+     * external submitter (OpenVR) actually needs.
+     */
+    void lockSubmissionQueueOnly() {
+      m_submissionQueue.lockDeviceQueue();
+    }
+
+    void unlockSubmissionQueueOnly() {
+      m_submissionQueue.unlockDeviceQueue();
+    }
+
+    /**
      * \brief Number of pending submissions
      * 
      * A return value of 0 indicates

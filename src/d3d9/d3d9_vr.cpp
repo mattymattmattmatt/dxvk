@@ -124,13 +124,16 @@ namespace dxvk {
         // DxvkDevice::waitForSubmission.
         HRESULT STDMETHODCALLTYPE LockSubmission()
         {
-            m_device->GetDXVKDevice()->lockSubmission();
+            // Queue mutex only. lockSubmission() also drains pending submissions,
+            // which deadlocks when called from inside Present -- the presentation
+            // in flight cannot retire while Present waits on it.
+            m_device->GetDXVKDevice()->lockSubmissionQueueOnly();
             return D3D_OK;
         }
 
         HRESULT STDMETHODCALLTYPE UnlockSubmission()
         {
-            m_device->GetDXVKDevice()->unlockSubmission();
+            m_device->GetDXVKDevice()->unlockSubmissionQueueOnly();
             return D3D_OK;
         }
 
