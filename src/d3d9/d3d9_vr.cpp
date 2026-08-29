@@ -12,6 +12,9 @@
 
 namespace dxvk {
 
+// Set from config: draw a VR aiming reticle into each eye.
+bool g_GESVR_DrawReticle = true;
+
     class D3D9VR final : public ComObjectClamp<IDirect3DVR9>
     {
     public:
@@ -186,6 +189,29 @@ namespace dxvk {
                 hr = m_device->StretchRect(src, srcRect, dest, nullptr, D3DTEXF_LINEAR);
                 if (FAILED(hr))
                     return hr;
+            }
+
+            // Aiming reticle, drawn straight into the eye image.
+            //
+            // The game's own crosshair never reaches the headset: +crosshair 1 is
+            // set, but the 2D HUD is not part of what we capture. In head-aim mode
+            // you aim with the centre of your view, so a centre reticle is both
+            // correct and independent of the game's HUD entirely.
+            if (g_GESVR_DrawReticle)
+            {
+                D3DSURFACE_DESC dd{};
+                if (SUCCEEDED(dest->GetDesc(&dd)) && dd.Width > 32 && dd.Height > 32)
+                {
+                    const LONG cx = (LONG)(dd.Width / 2);
+                    const LONG cy = (LONG)(dd.Height / 2);
+                    const LONG arm = (LONG)(dd.Height / 90) + 4;
+                    const LONG th  = (LONG)(dd.Height / 400) + 1;
+                    const D3DCOLOR col = D3DCOLOR_ARGB(255, 255, 245, 120);
+                    RECT hr2 = { cx - arm, cy - th, cx + arm, cy + th };
+                    RECT vr2 = { cx - th, cy - arm, cx + th, cy + arm };
+                    m_device->ColorFill(dest, &hr2, col);
+                    m_device->ColorFill(dest, &vr2, col);
+                }
             }
 
             TransferSurface(dest, TRUE);
