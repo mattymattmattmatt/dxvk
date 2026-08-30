@@ -1,4 +1,5 @@
 #include <cstdio>
+#include <atomic>
 #include "d3d9_swapchain.h"
 #include "d3d9_surface.h"
 #include "d3d9_monitor.h"
@@ -6,6 +7,8 @@
 #include "d3d9_hud.h"
 
 namespace dxvk {
+  extern std::atomic<uint32_t> g_GESVR_ClientW;
+  extern std::atomic<uint32_t> g_GESVR_ClientH;
 
 
   struct D3D9WindowData {
@@ -1380,21 +1383,23 @@ namespace dxvk {
 
     RECT dstRect;
     if (pDestRect == nullptr) {
-      // GESVR: this USER32 call is what admits the re-entrant callback above.
-      // The window does not resize during play, so cache it and refresh at
-      // most twice a second. That shrinks the window for the race enormously
-      // and costs nothing; the guard above closes it for good.
-      UINT width, height;
-      {
-        static UINT  s_cw = 0, s_ch = 0;
-        static DWORD s_at = 0;
-        const DWORD now = GetTickCount();
-        if (s_cw == 0 || s_ch == 0 || (now - s_at) > 500) {
-          GetWindowClientSize(m_window, &s_cw, &s_ch);
-          s_at = now;
-        }
-        width = s_cw; height = s_ch;
-      }
+      // GESVR: the window size comes from the input thread, NOT from USER32.
+      //
+      // This call was the root cause of the menu and exit freezes. Present
+      // called GetWindowClientSize; entering USER32 let the kernel deliver a
+      // queued window callback on this same thread, and that callback drove a
+      // nested present which waited on a submission this outer present had not
+      // finished issuing. Deadlock, with vgui2 on the stack whenever a menu was
+      // involved -- which is why exiting through the menu always froze.
+      //
+      // Caching it merely made the window smaller; the only fix is to never
+      // call USER32 from the present path. The thread that owns USER32
+      // publishes the size instead. The direct call remains only as a
+      // first-frame fallback, before anything has been published.
+      UINT width  = g_GESVR_ClientW.load();
+      UINT height = g_GESVR_ClientH.load();
+      if (width == 0 || height == 0)
+        GetWindowClientSize(m_window, &width, &height);
 
       dstRect.top    = 0;
       dstRect.left   = 0;

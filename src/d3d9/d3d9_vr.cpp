@@ -1,4 +1,5 @@
 #include <cstdio>
+#include <atomic>
 #include <cmath>
 #include "../dxvk/dxvk_include.h"
 
@@ -18,6 +19,12 @@ namespace dxvk {
 bool  g_GESVR_DrawReticle = true;
 // Force the menu overlay's alpha opaque. See ForceOpaqueAlpha.
 bool  g_GESVR_ForceMenuOpaque = true;
+// Client size of the game window, published by the thread that owns USER32.
+// Present must never call USER32 itself: entering it lets the kernel deliver a
+// queued window callback on the same thread, which drives a nested present that
+// waits on a submission the outer present has not finished issuing.
+std::atomic<uint32_t> g_GESVR_ClientW{ 0 };
+std::atomic<uint32_t> g_GESVR_ClientH{ 0 };
 // Reticle arm length as a fraction of eye-image height. The original was
 // height/90 + 4 (~16px arm at 1080), which reads as very large once the eye
 // image is magnified across the headset panel. Tunable via VRReticleSize.
