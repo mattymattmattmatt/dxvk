@@ -28,7 +28,7 @@ std::atomic<uint32_t> g_GESVR_ClientH{ 0 };
 // Reticle arm length as a fraction of eye-image height. The original was
 // height/90 + 4 (~16px arm at 1080), which reads as very large once the eye
 // image is magnified across the headset panel. Tunable via VRReticleSize.
-float g_GESVR_ReticleScale = 0.0025f;
+float g_GESVR_ReticleScale = 0.0007f;
 // Horizontal correction for the reticle. The eye surface is the full 16:9
 // backbuffer, and the whole of it is mapped onto a roughly square eye
 // viewport, which squashes X relative to Y -- so a circle drawn in pixels
@@ -244,8 +244,12 @@ int   g_GESVR_ReticleStyle = 1;
                     float sc = g_GESVR_ReticleScale;
                     if (sc < 0.001f) sc = 0.001f;
                     if (sc > 0.200f) sc = 0.200f;
-                    LONG arm = (LONG)(dd.Height * sc);
-                    if (arm < 3) arm = 3;
+                    // Keep this sub-pixel: at the old 3px floor the reticle was
+                    // pinned to the floor, so shrinking VRReticleSize did nothing.
+                    float armF = (float)dd.Height * sc;
+                    if (armF < 0.6f) armF = 0.6f;
+                    LONG arm = (LONG)(armF + 0.5f);
+                    if (arm < 1) arm = 1;
                     LONG th = arm / 5;
                     if (th < 1) th = 1;
                     const D3DCOLOR col = D3DCOLOR_ARGB(255, 255, 245, 120);
@@ -260,7 +264,7 @@ int   g_GESVR_ReticleStyle = 1;
                         // ColorFill only draws rectangles, so build the dot from one
                         // fill per scanline. The horizontal radius is widened by the
                         // aspect so it lands on screen as a circle, not an oval.
-                        const float ry = (float)arm;
+                        const float ry = armF;
                         const float rx = ry * ar;
                         const LONG iry = (LONG)(ry + 0.5f);
                         for (LONG dy = -iry; dy <= iry; ++dy)
