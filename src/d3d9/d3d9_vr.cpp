@@ -19,6 +19,10 @@ namespace dxvk {
 bool  g_GESVR_DrawReticle = true;
 // Force the menu overlay's alpha opaque. See ForceOpaqueAlpha.
 bool  g_GESVR_ForceMenuOpaque = true;
+// Swap which surface each eye captures into. A test, not a feature: if the
+// black eye follows the SURFACE it is m_right that is bad; if it stays on the
+// second eye rendered, the fault is in the second capture's timing instead.
+bool  g_GESVR_SwapEyeSurfaces = false;
 // Client size of the game window, published by the thread that owns USER32.
 // Present must never call USER32 itself: entering it lets the kernel deliver a
 // queued window callback on the same thread, which drives a nested present that
@@ -225,7 +229,8 @@ int   g_GESVR_ReticleStyle = 1;
             if (FAILED(hr))
                 return hr;
 
-            IDirect3DSurface9 *dest = (eye == 0) ? m_left : m_right;
+            const bool useLeftSurface = g_GESVR_SwapEyeSurfaces ? (eye != 0) : (eye == 0);
+            IDirect3DSurface9 *dest = useLeftSurface ? m_left : m_right;
             if (src != dest)
             {
                 hr = m_device->StretchRect(src, srcRect, dest, nullptr, D3DTEXF_LINEAR);
