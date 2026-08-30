@@ -202,7 +202,26 @@ int   g_GESVR_ReticleStyle = 1;
             if (!outTexture || !src)
                 return D3DERR_INVALIDCALL;
 
-            HRESULT hr = EnsureStereoSurfaces();
+            // Size the eye surfaces to the SOURCE, so a full-surface capture keeps
+            // its resolution instead of being squeezed into the window size.
+            UINT wantW = 0, wantH = 0;
+            {
+                D3DSURFACE_DESC sd{};
+                if (SUCCEEDED(src->GetDesc(&sd)))
+                {
+                    if (srcRect)
+                    {
+                        const LONG rw = srcRect->right - srcRect->left;
+                        const LONG rh = srcRect->bottom - srcRect->top;
+                        if (rw > 0 && rh > 0) { wantW = (UINT)rw; wantH = (UINT)rh; }
+                    }
+                    else
+                    {
+                        wantW = sd.Width; wantH = sd.Height;
+                    }
+                }
+            }
+            HRESULT hr = EnsureStereoSurfaces(wantW, wantH);
             if (FAILED(hr))
                 return hr;
 
@@ -577,7 +596,12 @@ int   g_GESVR_ReticleStyle = 1;
         }
 
     private:
-        HRESULT EnsureStereoSurfaces()
+        // wantW/wantH: the size the eye surfaces should be. Zero means 'match the
+        // backbuffer', which is the old behaviour. When rendering into dedicated eye
+        // render targets these must match THOSE, or the capture blit quietly
+        // downscales a high-resolution eye back to the window size and the whole
+        // point of the eye targets is lost.
+        HRESULT EnsureStereoSurfaces(UINT wantW = 0, UINT wantH = 0)
         {
             IDirect3DSurface9 *bb = nullptr;
             HRESULT hr = m_device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb);
@@ -587,6 +611,12 @@ int   g_GESVR_ReticleStyle = 1;
             D3DSURFACE_DESC desc{};
             bb->GetDesc(&desc);
             bb->Release();
+
+            if (wantW != 0 && wantH != 0)
+            {
+                desc.Width  = wantW;
+                desc.Height = wantH;
+            }
 
             if (m_left && m_right && m_eyeW == desc.Width && m_eyeH == desc.Height)
                 return D3D_OK;
@@ -604,7 +634,7 @@ int   g_GESVR_ReticleStyle = 1;
             }
             if (FAILED(hr))
             {
-                Game::logMsg("CreateRenderTarget left eye failed hr=0x%08X fmt=%d", (unsigned)hr, (int)fmt);
+                Game::logMsg("CreateRenderTarget left eye failed hr=0x%08X fmt=%d size=%ux%u", (unsigned)hr, (int)fmt, desc.Width, desc.Height);
                 return hr;
             }
 
