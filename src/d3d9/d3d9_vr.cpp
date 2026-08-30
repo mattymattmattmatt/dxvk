@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <cmath>
 #include "../dxvk/dxvk_include.h"
 
 #include "d3d9_vr.h"
@@ -13,7 +15,21 @@
 namespace dxvk {
 
 // Set from config: draw a VR aiming reticle into each eye.
-bool g_GESVR_DrawReticle = true;
+bool  g_GESVR_DrawReticle = true;
+// Force the menu overlay's alpha opaque. See ForceOpaqueAlpha.
+bool  g_GESVR_ForceMenuOpaque = true;
+// Reticle arm length as a fraction of eye-image height. The original was
+// height/90 + 4 (~16px arm at 1080), which reads as very large once the eye
+// image is magnified across the headset panel. Tunable via VRReticleSize.
+float g_GESVR_ReticleScale = 0.0025f;
+// Horizontal correction for the reticle. The eye surface is the full 16:9
+// backbuffer, and the whole of it is mapped onto a roughly square eye
+// viewport, which squashes X relative to Y -- so a circle drawn in pixels
+// comes out as a vertically stretched oval. Widening X by the surface aspect
+// cancels that. 0 = derive it from the surface; set a number to override.
+float g_GESVR_ReticleAspect = 0.0f;
+// 0 = cross, 1 = dot. A dot is far less intrusive at the centre of view.
+int   g_GESVR_ReticleStyle = 1;
 
     class D3D9VR final : public ComObjectClamp<IDirect3DVR9>
     {
@@ -188,7 +204,21 @@ bool g_GESVR_DrawReticle = true;
             {
                 hr = m_device->StretchRect(src, srcRect, dest, nullptr, D3DTEXF_LINEAR);
                 if (FAILED(hr))
+                {
+                    // Most likely cause is a multisampled source: D3D9 resolves
+                    // MSAA through StretchRect, but some paths reject a partial
+                    // source rect. Say so once instead of silently going black,
+                    // so mat_antialias can be ruled in or out from the log.
+                    static bool s_logged = false;
+                    if (!s_logged) {
+                        s_logged = true;
+                        if (FILE *f = fopen("C:/Users/Matty/AppData/Local/Temp/gesvr_boot.log", "a")) {
+                            fprintf(f, "[EYE] StretchRect FAILED hr=0x%08lX (try mat_antialias 0)\n", (unsigned long)hr);
+                            fclose(f);
+                        }
+                    }
                     return hr;
+                }
             }
 
             // Aiming reticle, drawn straight into the eye image.
@@ -204,13 +234,55 @@ bool g_GESVR_DrawReticle = true;
                 {
                     const LONG cx = (LONG)(dd.Width / 2);
                     const LONG cy = (LONG)(dd.Height / 2);
-                    const LONG arm = (LONG)(dd.Height / 90) + 4;
-                    const LONG th  = (LONG)(dd.Height / 400) + 1;
+                    float sc = g_GESVR_ReticleScale;
+                    if (sc < 0.001f) sc = 0.001f;
+                    if (sc > 0.200f) sc = 0.200f;
+                    LONG arm = (LONG)(dd.Height * sc);
+                    if (arm < 3) arm = 3;
+                    LONG th = arm / 5;
+                    if (th < 1) th = 1;
                     const D3DCOLOR col = D3DCOLOR_ARGB(255, 255, 245, 120);
-                    RECT hr2 = { cx - arm, cy - th, cx + arm, cy + th };
-                    RECT vr2 = { cx - th, cy - arm, cx + th, cy + arm };
-                    m_device->ColorFill(dest, &hr2, col);
-                    m_device->ColorFill(dest, &vr2, col);
+                    float ar = g_GESVR_ReticleAspect;
+                    if (ar <= 0.0f)
+                        ar = (dd.Height > 0) ? ((float)dd.Width / (float)dd.Height) : 1.0f;
+                    if (ar < 0.25f) ar = 0.25f;
+                    if (ar > 4.0f)  ar = 4.0f;
+
+                    if (g_GESVR_ReticleStyle == 1)
+                    {
+                        // ColorFill only draws rectangles, so build the dot from one
+                        // fill per scanline. The horizontal radius is widened by the
+                        // aspect so it lands on screen as a circle, not an oval.
+                        const float ry = (float)arm;
+                        const float rx = ry * ar;
+                        const LONG iry = (LONG)(ry + 0.5f);
+                        for (LONG dy = -iry; dy <= iry; ++dy)
+                        {
+                            const float ny = (float)dy / (ry + 0.5f);
+                            const float inside = 1.0f - ny * ny;
+                            if (inside <= 0.0f)
+                                continue;
+                            const LONG hw = (LONG)(rx * sqrtf(inside) + 0.5f);
+                            if (hw < 1)
+                                continue;
+                            RECT row = { cx - hw, cy + dy, cx + hw, cy + dy + 1 };
+                            if (row.left < 0) row.left = 0;
+                            if (row.top  < 0) row.top  = 0;
+                            if (row.right  > (LONG)dd.Width)  row.right  = (LONG)dd.Width;
+                            if (row.bottom > (LONG)dd.Height) row.bottom = (LONG)dd.Height;
+                            if (row.right > row.left && row.bottom > row.top)
+                                m_device->ColorFill(dest, &row, col);
+                        }
+                    }
+                    else
+                    {
+                        const LONG armX = (LONG)((float)arm * ar);
+                        const LONG thX  = (LONG)((float)th * ar) > 0 ? (LONG)((float)th * ar) : 1;
+                        RECT hr2 = { cx - armX, cy - th, cx + armX, cy + th };
+                        RECT vr2 = { cx - thX, cy - arm, cx + thX, cy + arm };
+                        m_device->ColorFill(dest, &hr2, col);
+                        m_device->ColorFill(dest, &vr2, col);
+                    }
                 }
             }
 
@@ -250,6 +322,89 @@ bool g_GESVR_DrawReticle = true;
             hr = FillEyeFromSurface(eye, src, nullptr, outTexture);
             src->Release();
             return hr;
+        }
+
+        // Force the overlay texture opaque.
+        //
+        // The overlay RT inherits the backbuffer's format and StretchRect copies
+        // the alpha channel verbatim. In a map Source leaves real alpha in there
+        // -- VGUI panels write it, the world largely does not -- and OpenVR
+        // honours it, so the panel renders semi-transparent with the game showing
+        // through. This SDK has no VROverlayFlags_IgnoreTextureAlpha, so the
+        // alpha has to be written for real.
+        //
+        // Writes ONLY the alpha channel via the colour-write mask, so the colour
+        // copied above is untouched. All state is saved and restored around it:
+        // this runs inside PresentEx while the game is mid-frame.
+        void ForceOpaqueAlpha()
+        {
+            if (!g_GESVR_ForceMenuOpaque || m_alphaSBFailed || !m_overlay)
+                return;
+
+            IDirect3DSurface9 *oldRT = nullptr, *oldDS = nullptr;
+            if (FAILED(m_device->GetRenderTarget(0, &oldRT)))
+                return;
+            m_device->GetDepthStencilSurface(&oldDS);   // may legitimately be null
+
+            if (!m_alphaSB)
+            {
+                if (FAILED(m_device->CreateStateBlock(D3DSBT_ALL, &m_alphaSB)) || !m_alphaSB)
+                {
+                    m_alphaSBFailed = true;
+                    Game::logMsg("ForceOpaqueAlpha: CreateStateBlock failed, menu alpha left as-is");
+                    if (oldRT) oldRT->Release();
+                    if (oldDS) oldDS->Release();
+                    return;
+                }
+            }
+            else
+                m_alphaSB->Capture();
+
+            struct V { float x, y, z, rhw; D3DCOLOR c; };
+            const float w = (float)m_overlayW, h = (float)m_overlayH;
+            const D3DCOLOR opaque = D3DCOLOR_ARGB(255, 0, 0, 0);
+            V quad[4] = {
+                { -0.5f,     -0.5f,     0.0f, 1.0f, opaque },
+                {  w - 0.5f, -0.5f,     0.0f, 1.0f, opaque },
+                { -0.5f,      h - 0.5f, 0.0f, 1.0f, opaque },
+                {  w - 0.5f,  h - 0.5f, 0.0f, 1.0f, opaque },
+            };
+
+            m_device->SetDepthStencilSurface(nullptr);
+            m_device->SetVertexShader(nullptr);
+            m_device->SetPixelShader(nullptr);
+            m_device->SetTexture(0, nullptr);
+            m_device->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+            m_device->SetRenderState(D3DRS_COLORWRITEENABLE, D3DCOLORWRITEENABLE_ALPHA);
+            m_device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+            m_device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+            m_device->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
+            m_device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+            m_device->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+            m_device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+            m_device->SetRenderState(D3DRS_LIGHTING, FALSE);
+            m_device->SetRenderState(D3DRS_FOGENABLE, FALSE);
+            m_device->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+            m_device->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
+            const HRESULT hrRT   = m_device->SetRenderTarget(0, m_overlay);
+            const HRESULT hrDraw = m_device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(V));
+            // The alpha write used to fail silently. Say once whether it worked,
+            // so a see-through menu can be confirmed or ruled out from the log.
+            {
+                static bool s_reported = false;
+                if (!s_reported)
+                {
+                    s_reported = true;
+                    Game::logMsg("ForceOpaqueAlpha: setRT=0x%08X draw=0x%08X %ux%u",
+                                 (unsigned)hrRT, (unsigned)hrDraw, m_overlayW, m_overlayH);
+                }
+            }
+
+            m_alphaSB->Apply();
+            m_device->SetRenderTarget(0, oldRT);
+            m_device->SetDepthStencilSurface(oldDS);
+            if (oldRT) oldRT->Release();
+            if (oldDS) oldDS->Release();
         }
 
         HRESULT STDMETHODCALLTYPE CaptureForOverlay(SharedTextureHolder *outTexture, int cursorX, int cursorY)
@@ -306,6 +461,8 @@ bool g_GESVR_DrawReticle = true;
                 mark(cursorX - 2, cursorY - 14, cursorX + 2, cursorY + 14, D3DCOLOR_ARGB(255, 255, 230, 40));
                 mark(cursorX - 4, cursorY - 4, cursorX + 4, cursorY + 4, D3DCOLOR_ARGB(255, 255, 80, 40));
             }
+
+            ForceOpaqueAlpha();
 
             // No Flush: this runs inside PresentEx, before the swap. Flushing
             // here deadlocks DXVK against the Present that follows. The swap
@@ -468,6 +625,8 @@ bool g_GESVR_DrawReticle = true;
         IDirect3DSurface9 *m_black = nullptr;
         IDirect3DSurface9 *m_overlay = nullptr;
         IDirect3DSurface9 *m_sbs = nullptr;
+        IDirect3DStateBlock9 *m_alphaSB = nullptr;
+        bool m_alphaSBFailed = false;
         UINT m_eyeW = 0;
         UINT m_eyeH = 0;
         UINT m_overlayW = 0;

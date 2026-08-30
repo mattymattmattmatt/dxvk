@@ -1,3 +1,4 @@
+#include <cstdio>
 #include "d3d9_swapchain.h"
 #include "d3d9_surface.h"
 #include "d3d9_monitor.h"
@@ -250,6 +251,30 @@ namespace dxvk {
           HWND     hDestWindowOverride,
     const RGNDATA* pDirtyRegion,
           DWORD    dwFlags) {
+    // GESVR: re-entrancy guard.
+    //
+    // Present calls GetWindowClientSize below, which is a USER32 call. Entering
+    // USER32 lets the kernel deliver a queued window-proc callback on this very
+    // thread, and the game's proc can drive a repaint that calls straight back
+    // into Present. The nested call then waits on a GPU submission that cannot
+    // retire, because the outer Present has not finished issuing it -- a hard
+    // freeze whose stack reads Present -> GetWindowClientSize -> USER32 ->
+    // callback dispatcher -> PresentImage -> waitForSubmission -> wait.
+    //
+    // The messages being delivered are largely ours: the VR menu pointer posts
+    // synthetic mouse moves and clicks to this window at up to 30Hz.
+    //
+    // A nested present is meaningless -- the outer one is already producing the
+    // frame -- so report success and unwind.
+    static thread_local bool s_inPresent = false;
+    if (s_inPresent)
+      return D3D_OK;
+    struct PresentGuard {
+      bool &f;
+      explicit PresentGuard(bool &v) : f(v) { f = true; }
+      ~PresentGuard() { f = false; }
+    } presentGuard(s_inPresent);
+
     D3D9DeviceLock lock = m_parent->LockDevice();
 
     uint32_t presentInterval = m_presentParams.PresentationInterval;
@@ -809,6 +834,31 @@ namespace dxvk {
 
 
   void D3D9SwapChainEx::PresentImage(UINT SyncInterval) {
+    // GESVR: re-entrancy guard, second layer.
+    //
+    // The guard on Present() above catches re-entry that comes back in through
+    // Present. A freeze stack showed the nested call landing directly HERE
+    // instead -- Present -> callback dispatcher -> PresentImage ->
+    // waitForSubmission -> blocked forever, waiting on a submission the outer
+    // Present has not finished issuing. Guarding only the outer entry point
+    // left that path open, so guard this one too.
+    static thread_local bool s_inPresentImage = false;
+    if (s_inPresentImage) {
+      static bool s_logged = false;
+      if (!s_logged) {
+        s_logged = true;
+        if (FILE *f = fopen("C:/Users/Matty/AppData/Local/Temp/gesvr_boot.log", "a"))
+        { fputs("[PRESENT] re-entrant PresentImage blocked (this would have frozen)", f);
+          fputc(10, f); fclose(f); }
+      }
+      return;
+    }
+    struct ImageGuard {
+      bool &f;
+      explicit ImageGuard(bool &v) : f(v) { f = true; }
+      ~ImageGuard() { f = false; }
+    } imageGuard(s_inPresentImage);
+
     m_parent->Flush();
 
     // Retrieve the image and image view to present
@@ -1330,9 +1380,21 @@ namespace dxvk {
 
     RECT dstRect;
     if (pDestRect == nullptr) {
-      // TODO: Should we hook WM_SIZE message for this?
+      // GESVR: this USER32 call is what admits the re-entrant callback above.
+      // The window does not resize during play, so cache it and refresh at
+      // most twice a second. That shrinks the window for the race enormously
+      // and costs nothing; the guard above closes it for good.
       UINT width, height;
-      GetWindowClientSize(m_window, &width, &height);
+      {
+        static UINT  s_cw = 0, s_ch = 0;
+        static DWORD s_at = 0;
+        const DWORD now = GetTickCount();
+        if (s_cw == 0 || s_ch == 0 || (now - s_at) > 500) {
+          GetWindowClientSize(m_window, &s_cw, &s_ch);
+          s_at = now;
+        }
+        width = s_cw; height = s_ch;
+      }
 
       dstRect.top    = 0;
       dstRect.left   = 0;
