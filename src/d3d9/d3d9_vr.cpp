@@ -349,6 +349,23 @@ int   g_GESVR_ReticleStyle = 1;
                 return CaptureEye(eye, nullptr, outTexture);
             }
 
+            // What are we actually capturing? If the right eye reports the
+            // backbuffer size rather than the eye texture size, the material
+            // system's SetRenderTarget did not take for the second pass and the
+            // right eye was never drawn into -- which is what 'mostly black'
+            // looks like. Logged for the first few passes only.
+            {
+                static int s_logged = 0;
+                if (s_logged < 8)
+                {
+                    ++s_logged;
+                    D3DSURFACE_DESC sd{};
+                    if (SUCCEEDED(src->GetDesc(&sd)))
+                        Game::logMsg("CaptureCurrentRT eye=%d source RT is %ux%u",
+                                     eye, sd.Width, sd.Height);
+                }
+            }
+
             hr = FillEyeFromSurface(eye, src, nullptr, outTexture);
             src->Release();
             return hr;
