@@ -366,58 +366,13 @@ int   g_GESVR_ReticleStyle = 1;
                 }
             }
 
-            // One-shot: where in the target did the engine actually draw?
-            //
-            // The target binds correctly and reports the full size, yet the right
-            // eye is black and the gun sits high -- both of which look like the
-            // scene occupying only part of a larger target. Rather than infer it
-            // again, read the surface back once and report the bounding box of
-            // non-black pixels. If that box is the window size in the top-left,
-            // the engine is clamping the viewport.
-            {
-                static int s_probed = 0;
-                if (s_probed < 4)   // both eyes: is the right one empty?
-                {
-                    ++s_probed;
-                    D3DSURFACE_DESC sd{};
-                    if (SUCCEEDED(src->GetDesc(&sd)))
-                    {
-                        IDirect3DSurface9 *sys = nullptr;
-                        if (SUCCEEDED(m_device->CreateOffscreenPlainSurface(
-                                sd.Width, sd.Height, sd.Format, D3DPOOL_SYSTEMMEM, &sys, nullptr)) && sys)
-                        {
-                            if (SUCCEEDED(m_device->GetRenderTargetData(src, sys)))
-                            {
-                                D3DLOCKED_RECT lr{};
-                                if (SUCCEEDED(sys->LockRect(&lr, nullptr, D3DLOCK_READONLY)))
-                                {
-                                    LONG minX = (LONG)sd.Width, minY = (LONG)sd.Height, maxX = -1, maxY = -1;
-                                    const BYTE *base = (const BYTE *)lr.pBits;
-                                    for (UINT y = 0; y < sd.Height; y += 4)
-                                    {
-                                        const DWORD *row = (const DWORD *)(base + (size_t)y * lr.Pitch);
-                                        for (UINT x = 0; x < sd.Width; x += 4)
-                                        {
-                                            if ((row[x] & 0x00FFFFFF) != 0)
-                                            {
-                                                if ((LONG)x < minX) minX = (LONG)x;
-                                                if ((LONG)x > maxX) maxX = (LONG)x;
-                                                if ((LONG)y < minY) minY = (LONG)y;
-                                                if ((LONG)y > maxY) maxY = (LONG)y;
-                                            }
-                                        }
-                                    }
-                                    sys->UnlockRect();
-                                    Game::logMsg("EYEPROBE target=%ux%u drawn box x[%ld..%ld] y[%ld..%ld] = %ldx%ld",
-                                                 sd.Width, sd.Height, minX, maxX, minY, maxY,
-                                                 maxX - minX + 1, maxY - minY + 1);
-                                }
-                            }
-                            sys->Release();
-                        }
-                    }
-                }
-            }
+            // The pixel-readback probe that lived here is REMOVED. It answered its
+            // question -- both eye targets come back fully drawn, so the engine
+            // renders both eyes and the right eye's black frame happens after this
+            // point, in capture or submit -- but reading a render target back to
+            // system memory forces a blocking GPU sync, and doing that from inside
+            // the render path froze the game on the stereo pass every time. If that
+            // measurement is ever needed again it belongs off the render thread.
 
             hr = FillEyeFromSurface(eye, src, nullptr, outTexture);
             src->Release();
