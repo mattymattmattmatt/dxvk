@@ -115,6 +115,23 @@ namespace dxvk {
     if (message == WM_NCCALCSIZE && wparam == TRUE)
       return 0;
 
+    // GESVR: this is where the client size comes from.
+    //
+    // Present must not call USER32 (it deadlocks), and sourcing the size from
+    // another thread's FindWindow is unsafe -- that can find a different
+    // top-level window than the one this swapchain presents to, and a wrong
+    // size corrupts the present blit. WM_SIZE arrives on the real window with
+    // the client size already in lParam, so it needs no USER32 call and cannot
+    // be about the wrong window.
+    if (message == WM_SIZE) {
+      const uint32_t cw = (uint32_t)LOWORD(lparam);
+      const uint32_t ch = (uint32_t)HIWORD(lparam);
+      if (cw != 0 && ch != 0) {
+        g_GESVR_ClientW.store(cw);
+        g_GESVR_ClientH.store(ch);
+      }
+    }
+
     D3D9WindowData windowData = {};
 
     {
@@ -1398,8 +1415,16 @@ namespace dxvk {
       // first-frame fallback, before anything has been published.
       UINT width  = g_GESVR_ClientW.load();
       UINT height = g_GESVR_ClientH.load();
-      if (width == 0 || height == 0)
+      if (width == 0 || height == 0) {
+        // First frame only: the window existed before the proc was subclassed,
+        // so no WM_SIZE has been seen yet. Seed the cache once and never call
+        // USER32 from here again -- doing it per frame is what deadlocked.
         GetWindowClientSize(m_window, &width, &height);
+        if (width != 0 && height != 0) {
+          g_GESVR_ClientW.store(width);
+          g_GESVR_ClientH.store(height);
+        }
+      }
 
       dstRect.top    = 0;
       dstRect.left   = 0;
