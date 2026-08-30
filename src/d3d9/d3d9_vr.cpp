@@ -376,7 +376,7 @@ int   g_GESVR_ReticleStyle = 1;
             // the engine is clamping the viewport.
             {
                 static int s_probed = 0;
-                if (s_probed < 2 && eye == 0)
+                if (s_probed < 4)   // both eyes: is the right one empty?
                 {
                     ++s_probed;
                     D3DSURFACE_DESC sd{};
