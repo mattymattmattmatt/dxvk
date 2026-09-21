@@ -39,8 +39,18 @@ float g_GESVR_ReticleScale = 0.0007f;
 // comes out as a vertically stretched oval. Widening X by the surface aspect
 // cancels that. 0 = derive it from the surface; set a number to override.
 float g_GESVR_ReticleAspect = 0.0f;
-// 0 = cross, 1 = dot. A dot is far less intrusive at the centre of view.
+// 0 = cross, 1 = dot, 2 = ring, 3 = ring + dot. A dot is far less intrusive at
+// the centre of view.
 int   g_GESVR_ReticleStyle = 1;
+// Index into kReticleColors: yellow, white, green, red, cyan.
+int   g_GESVR_ReticleColor = 0;
+static const D3DCOLOR kReticleColors[] = {
+    D3DCOLOR_ARGB(255, 255, 245, 120),
+    D3DCOLOR_ARGB(255, 255, 255, 255),
+    D3DCOLOR_ARGB(255, 90, 255, 110),
+    D3DCOLOR_ARGB(255, 255, 70, 60),
+    D3DCOLOR_ARGB(255, 80, 230, 255),
+};
 
     class D3D9VR final : public ComObjectClamp<IDirect3DVR9>
     {
@@ -276,40 +286,76 @@ int   g_GESVR_ReticleStyle = 1;
                     if (arm < 1) arm = 1;
                     LONG th = arm / 5;
                     if (th < 1) th = 1;
-                    const D3DCOLOR col = D3DCOLOR_ARGB(255, 255, 245, 120);
+                    const int ci = g_GESVR_ReticleColor;
+                    const D3DCOLOR col = kReticleColors[(ci >= 0 && ci < 5) ? ci : 0];
                     float ar = g_GESVR_ReticleAspect;
                     if (ar <= 0.0f)
                         ar = (dd.Height > 0) ? ((float)dd.Width / (float)dd.Height) : 1.0f;
                     if (ar < 0.25f) ar = 0.25f;
                     if (ar > 4.0f)  ar = 4.0f;
 
-                    if (g_GESVR_ReticleStyle == 1)
-                    {
-                        // ColorFill only draws rectangles, so build the dot from one
-                        // fill per scanline. The horizontal radius is widened by the
-                        // aspect so it lands on screen as a circle, not an oval.
-                        const float ry = armF;
-                        const float rx = ry * ar;
-                        const LONG iry = (LONG)(ry + 0.5f);
-                        for (LONG dy = -iry; dy <= iry; ++dy)
+                    // ColorFill only draws rectangles, so round shapes are built
+                    // from one fill per scanline. Horizontal radii are widened by
+                    // the aspect so they land on screen as circles, not ovals.
+                    auto span = [&](LONG x0, LONG x1, LONG y) {
+                        RECT row = { x0, y, x1, y + 1 };
+                        if (row.left < 0) row.left = 0;
+                        if (row.top  < 0) row.top  = 0;
+                        if (row.right  > (LONG)dd.Width)  row.right  = (LONG)dd.Width;
+                        if (row.bottom > (LONG)dd.Height) row.bottom = (LONG)dd.Height;
+                        if (row.right > row.left && row.bottom > row.top)
+                            m_device->ColorFill(dest, &row, col);
+                    };
+                    // Half-width of a circle of radius r at row offset dy, or -1 outside it.
+                    auto halfWidth = [&](float r, LONG dy) -> LONG {
+                        const float ny = (float)dy / (r + 0.5f);
+                        const float inside = 1.0f - ny * ny;
+                        if (inside <= 0.0f)
+                            return -1;
+                        return (LONG)(r * ar * sqrtf(inside) + 0.5f);
+                    };
+                    auto disc = [&](float r) {
+                        const LONG ir = (LONG)(r + 0.5f);
+                        for (LONG dy = -ir; dy <= ir; ++dy)
                         {
-                            const float ny = (float)dy / (ry + 0.5f);
-                            const float inside = 1.0f - ny * ny;
-                            if (inside <= 0.0f)
-                                continue;
-                            const LONG hw = (LONG)(rx * sqrtf(inside) + 0.5f);
-                            if (hw < 1)
-                                continue;
-                            RECT row = { cx - hw, cy + dy, cx + hw, cy + dy + 1 };
-                            if (row.left < 0) row.left = 0;
-                            if (row.top  < 0) row.top  = 0;
-                            if (row.right  > (LONG)dd.Width)  row.right  = (LONG)dd.Width;
-                            if (row.bottom > (LONG)dd.Height) row.bottom = (LONG)dd.Height;
-                            if (row.right > row.left && row.bottom > row.top)
-                                m_device->ColorFill(dest, &row, col);
+                            const LONG hw = halfWidth(r, dy);
+                            if (hw >= 1)
+                                span(cx - hw, cx + hw, cy + dy);
                         }
-                    }
-                    else
+                    };
+                    auto ring = [&](float outer, float thick) {
+                        const float inner = outer - thick;
+                        const LONG io = (LONG)(outer + 0.5f);
+                        for (LONG dy = -io; dy <= io; ++dy)
+                        {
+                            const LONG ho = halfWidth(outer, dy);
+                            if (ho < 1)
+                                continue;
+                            const LONG hi = (inner > 0.5f) ? halfWidth(inner, dy) : -1;
+                            if (hi < 1)
+                                span(cx - ho, cx + ho, cy + dy);
+                            else
+                            {
+                                span(cx - ho, cx - hi, cy + dy);
+                                span(cx + hi, cx + ho, cy + dy);
+                            }
+                        }
+                    };
+
+                    const float thick = (armF * 0.7f < 1.0f) ? 1.0f : armF * 0.7f;
+                    switch (g_GESVR_ReticleStyle)
+                    {
+                    case 1:
+                        disc(armF);
+                        break;
+                    case 2:
+                        ring(armF * 3.0f, thick);
+                        break;
+                    case 3:
+                        ring(armF * 3.0f, thick);
+                        disc(armF * 0.8f);
+                        break;
+                    default:
                     {
                         const LONG armX = (LONG)((float)arm * ar);
                         const LONG thX  = (LONG)((float)th * ar) > 0 ? (LONG)((float)th * ar) : 1;
@@ -317,6 +363,8 @@ int   g_GESVR_ReticleStyle = 1;
                         RECT vr2 = { cx - thX, cy - arm, cx + thX, cy + arm };
                         m_device->ColorFill(dest, &hr2, col);
                         m_device->ColorFill(dest, &vr2, col);
+                        break;
+                    }
                     }
                 }
             }
