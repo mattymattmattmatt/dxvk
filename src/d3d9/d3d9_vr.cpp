@@ -44,6 +44,15 @@ float g_GESVR_ReticleAspect = 0.0f;
 int   g_GESVR_ReticleStyle = 1;
 // Index into kReticleColors: yellow, white, green, red, cyan.
 int   g_GESVR_ReticleColor = 0;
+// Tracked gun: draw the reticle where the barrel's aim point lands in each
+// eye (normalised image coordinates), not at the centre. Hidden for an eye
+// whose point is not valid (behind it, or no gun held).
+// Set while zoomed in: the reticle shows even with VRReticle off.
+bool  g_GESVR_ReticleForce = false;
+bool  g_GESVR_ReticleUseAim = false;
+bool  g_GESVR_ReticleAimValid[2] = { false, false };
+float g_GESVR_ReticleAimU[2] = { 0.5f, 0.5f };
+float g_GESVR_ReticleAimV[2] = { 0.5f, 0.5f };
 static const D3DCOLOR kReticleColors[] = {
     D3DCOLOR_ARGB(255, 255, 245, 120),
     D3DCOLOR_ARGB(255, 255, 255, 255),
@@ -268,13 +277,20 @@ static const D3DCOLOR kReticleColors[] = {
             // set, but the 2D HUD is not part of what we capture. In head-aim mode
             // you aim with the centre of your view, so a centre reticle is both
             // correct and independent of the game's HUD entirely.
-            if (g_GESVR_DrawReticle)
+            const int aimEye = (eye == 0) ? 0 : 1;
+            const bool aimHidden = g_GESVR_ReticleUseAim && !g_GESVR_ReticleAimValid[aimEye];
+            if ((g_GESVR_DrawReticle || g_GESVR_ReticleForce) && !aimHidden)
             {
                 D3DSURFACE_DESC dd{};
                 if (SUCCEEDED(dest->GetDesc(&dd)) && dd.Width > 32 && dd.Height > 32)
                 {
-                    const LONG cx = (LONG)(dd.Width / 2);
-                    const LONG cy = (LONG)(dd.Height / 2);
+                    LONG cx = (LONG)(dd.Width / 2);
+                    LONG cy = (LONG)(dd.Height / 2);
+                    if (g_GESVR_ReticleUseAim)
+                    {
+                        cx = (LONG)(g_GESVR_ReticleAimU[aimEye] * (float)dd.Width);
+                        cy = (LONG)(g_GESVR_ReticleAimV[aimEye] * (float)dd.Height);
+                    }
                     float sc = g_GESVR_ReticleScale;
                     if (sc < 0.001f) sc = 0.001f;
                     if (sc > 0.200f) sc = 0.200f;
@@ -343,8 +359,56 @@ static const D3DCOLOR kReticleColors[] = {
                     };
 
                     const float thick = (armF * 0.7f < 1.0f) ? 1.0f : armF * 0.7f;
+                    // Filled box, clipped to the surface.
+                    auto box = [&](LONG x0, LONG y0, LONG x1, LONG y1) {
+                        RECT r = { x0, y0, x1, y1 };
+                        if (r.left < 0) r.left = 0;
+                        if (r.top  < 0) r.top  = 0;
+                        if (r.right  > (LONG)dd.Width)  r.right  = (LONG)dd.Width;
+                        if (r.bottom > (LONG)dd.Height) r.bottom = (LONG)dd.Height;
+                        if (r.right > r.left && r.bottom > r.top)
+                            m_device->ColorFill(dest, &r, col);
+                    };
                     switch (g_GESVR_ReticleStyle)
                     {
+                    case 4:
+                    {
+                        // Classic: GoldenEye's crosshair (GE:S sprites/crosshair)
+                        // -- a ring with four spikes tapering in towards a clear
+                        // centre, the spikes poking just past the ring. Much
+                        // bigger than the dot for the same size setting so the
+                        // spikes survive at the smallest size.
+                        float R = armF * 6.0f;
+                        if (R < 6.0f) R = 6.0f;
+                        if (R > (float)dd.Height * 0.25f) R = (float)dd.Height * 0.25f;
+                        const float t = (R * 0.12f < 1.0f) ? 1.0f : R * 0.12f;
+                        ring(R, t);
+                        const float tip = R * 0.28f, inner = R - t, nub = R * 1.10f;
+                        const float w0 = (R * 0.09f < 1.0f) ? 1.0f : R * 0.09f;
+                        // Half-thickness of a spike at distance d from the centre.
+                        auto spike = [&](float d) -> float {
+                            if (d > inner)
+                                return w0 * 0.7f;
+                            const float k = (d - tip) / (inner - tip);
+                            return (k < 0.0f ? 0.0f : k) * w0;
+                        };
+                        // Top and bottom: one row at a time.
+                        for (LONG d = (LONG)tip; d <= (LONG)nub; ++d)
+                        {
+                            const LONG hw = (LONG)(spike((float)d) * ar + 0.5f);
+                            box(cx - hw, cy - d, cx + hw + 1, cy - d + 1);
+                            box(cx - hw, cy + d, cx + hw + 1, cy + d + 1);
+                        }
+                        // Left and right: one column at a time, widened by the
+                        // aspect like the ring so the shape stays round.
+                        for (LONG px = (LONG)(tip * ar); px <= (LONG)(nub * ar); ++px)
+                        {
+                            const LONG hh = (LONG)(spike((float)px / ar) + 0.5f);
+                            box(cx - px, cy - hh, cx - px + 1, cy + hh + 1);
+                            box(cx + px, cy - hh, cx + px + 1, cy + hh + 1);
+                        }
+                        break;
+                    }
                     case 1:
                         disc(armF);
                         break;
