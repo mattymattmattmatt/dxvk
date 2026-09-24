@@ -12,6 +12,7 @@
 
 #include "L4D2VR/game.h"
 #include "L4D2VR/vr.h"
+#include "L4D2VR/vr_guide.h"
 
 namespace dxvk {
 
@@ -60,6 +61,9 @@ static const D3DCOLOR kReticleColors[] = {
     D3DCOLOR_ARGB(255, 255, 70, 60),
     D3DCOLOR_ARGB(255, 80, 230, 255),
 };
+// The throw guide (see L4D2VR/vr_guide.h and VR::UpdateThrowGuide).
+int g_GESVR_GuideCount[2] = { 0, 0 };
+GESVR_GuideDot g_GESVR_Guide[2][kGESVRGuideMax];
 
     class D3D9VR final : public ComObjectClamp<IDirect3DVR9>
     {
@@ -429,6 +433,62 @@ static const D3DCOLOR kReticleColors[] = {
                         m_device->ColorFill(dest, &vr2, col);
                         break;
                     }
+                    }
+                }
+            }
+
+            // The throw guide: its own dots, drawn whether or not the reticle
+            // is on (VR::UpdateThrowGuide leaves the count at 0 when the guide
+            // is off). A tiny dot is one fill; bigger ones are built a scanline
+            // at a time like the reticle's disc, widened by the same surface
+            // aspect so they land in the headset round, not stretched.
+            {
+                const int gi = (eye == 0) ? 0 : 1;
+                const int count = g_GESVR_GuideCount[gi];
+                D3DSURFACE_DESC gd{};
+                if (count > 0 && SUCCEEDED(dest->GetDesc(&gd)) && gd.Width > 32 && gd.Height > 32)
+                {
+                    float gar = g_GESVR_ReticleAspect;
+                    if (gar <= 0.0f)
+                        gar = (float)gd.Width / (float)gd.Height;
+                    if (gar < 0.25f) gar = 0.25f;
+                    if (gar > 4.0f)  gar = 4.0f;
+                    const int ci = g_GESVR_ReticleColor;
+                    const D3DCOLOR cols[3] = { kReticleColors[(ci >= 0 && ci < 5) ? ci : 0],
+                                               D3DCOLOR_ARGB(255, 115, 115, 115),
+                                               D3DCOLOR_ARGB(255, 255, 70, 60) };
+                    const LONG gw = (LONG)gd.Width, gh = (LONG)gd.Height;
+                    auto fill = [&](LONG x0, LONG y0, LONG x1, LONG y1, D3DCOLOR col) {
+                        RECT rc = { x0 < 0 ? 0 : x0, y0 < 0 ? 0 : y0, x1 > gw ? gw : x1, y1 > gh ? gh : y1 };
+                        if (rc.right > rc.left && rc.bottom > rc.top)
+                            m_device->ColorFill(dest, &rc, col);
+                    };
+                    for (int i = 0; i < count && i < kGESVRGuideMax; ++i)
+                    {
+                        const GESVR_GuideDot &d = g_GESVR_Guide[gi][i];
+                        const LONG cx = (LONG)(d.u * (float)gw), cy = (LONG)(d.v * (float)gh);
+                        if (cx < -8 || cy < -8 || cx > gw + 8 || cy > gh + 8)
+                            continue;
+                        float r = d.r * (float)gh;
+                        if (r < 0.55f) r = 0.55f;
+                        if (r > 4.5f) r = 4.5f;
+                        const D3DCOLOR col = cols[(d.c >= 0 && d.c < 3) ? d.c : 0];
+                        if (r < 1.6f)
+                        {
+                            const LONG hw = (LONG)(r * gar + 0.5f), hh = (LONG)(r + 0.5f);
+                            fill(cx - hw, cy - hh, cx + hw + 1, cy + hh + 1, col);
+                            continue;
+                        }
+                        const LONG ir = (LONG)(r + 0.5f);
+                        for (LONG dy = -ir; dy <= ir; ++dy)
+                        {
+                            const float ny = (float)dy / (r + 0.5f);
+                            const float inside = 1.0f - ny * ny;
+                            if (inside <= 0.0f)
+                                continue;
+                            const LONG hw = (LONG)(r * gar * sqrtf(inside) + 0.5f);
+                            fill(cx - hw, cy + dy, cx + hw + 1, cy + dy + 1, col);
+                        }
                     }
                 }
             }
