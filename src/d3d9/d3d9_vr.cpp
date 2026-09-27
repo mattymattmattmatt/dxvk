@@ -190,6 +190,31 @@ GESVR_GuideDot g_GESVR_Guide[2][kGESVRGuideMax];
             return D3D_OK;
         }
 
+        // Out of a map these are dead weight: two window-sized render targets
+        // (2560x1440 A8R8G8B8 is 14.7 MB each) plus the side-by-side buffer at
+        // double width, all held from the first map until the process exits.
+        // A map load is exactly when that space is worth most -- loads have
+        // died here with 75 MB free and a largest hole of 32 MB.
+        //
+        // No GPU wait: DXVK defers the real destruction until the images are
+        // idle, and waiting for the GPU from inside PresentEx is the shape of
+        // every deadlock this mod has had. The caller stops submitting these
+        // several frames before calling, which covers the compositor.
+        HRESULT STDMETHODCALLTYPE ReleaseEyeSurfaces()
+        {
+            if (!m_left && !m_right && !m_sbs)
+                return S_FALSE;
+
+            const UINT w = m_eyeW, h = m_eyeH;
+            if (m_left)  { m_left->Release();  m_left = nullptr; }
+            if (m_right) { m_right->Release(); m_right = nullptr; }
+            if (m_sbs)   { m_sbs->Release();   m_sbs = nullptr; }
+            m_eyeW = m_eyeH = 0;
+            m_sbsW = m_sbsH = 0;      // so the size check rebuilds them
+            Game::logMsg("Stereo D3D RTs released (were %ux%u)", w, h);
+            return D3D_OK;
+        }
+
         HRESULT STDMETHODCALLTYPE WaitDeviceIdle()
         {
             m_device->Flush();

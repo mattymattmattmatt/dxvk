@@ -51,6 +51,11 @@ IDirect3DVR9 : public IUnknown{
   // DxvkDevice::waitForSubmission blocking forever inside Present.
   virtual HRESULT STDMETHODCALLTYPE LockSubmission() = 0;
   virtual HRESULT STDMETHODCALLTYPE UnlockSubmission() = 0;
+  // Hand the eye render targets back. They are only used in a map, and they
+  // are among the largest single allocations in a process that dies of a full
+  // 2 GB address space during map loads. Recreated on demand by the next
+  // capture. The caller must have stopped submitting them first.
+  virtual HRESULT STDMETHODCALLTYPE ReleaseEyeSurfaces() = 0;
 };
 
 #ifdef _MSC_VER
