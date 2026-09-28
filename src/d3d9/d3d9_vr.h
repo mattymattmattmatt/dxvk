@@ -64,6 +64,10 @@ IDirect3DVR9 : public IUnknown{
   // these into one call.
   virtual HRESULT STDMETHODCALLTYPE DiagEyeDumpIssue(UINT maxWidth) = 0;
   virtual HRESULT STDMETHODCALLTYPE DiagEyeDumpWrite(const char *pathPrefix) = 0;
+  // Per-eye path: paint the window with a window-shaped crop of the LEFT eye
+  // as last captured, centred in (u0,v0)-(u1,v1) -- the part of the eye image
+  // the headset shows. What the desktop window and every in-map menu sit on.
+  virtual HRESULT STDMETHODCALLTYPE FillBackBufferFromEye(float u0, float v0, float u1, float v1) = 0;
 };
 
 #ifdef _MSC_VER

@@ -1,6 +1,7 @@
 #include <cstdio>
 #include <atomic>
 #include <cmath>
+#include <algorithm>
 #include "../dxvk/dxvk_include.h"
 
 #include "d3d9_vr.h"
@@ -26,6 +27,7 @@ namespace dxvk {
 // ---------------------------------------------------------------------------
 int  g_GESVR_EyePass = 0;
 bool g_GESVR_EyeTrace = false;
+bool g_GESVR_DiagForceUpload = false;
 
 namespace {
     unsigned s_traceEyeW = 0, s_traceEyeH = 0;
@@ -43,7 +45,8 @@ namespace {
     };
     std::vector<DrawState> s_traceDraws;
 
-    char EyeChar(int e) { return e == 1 ? 'L' : e == 2 ? 'R' : e == 3 ? 'H' : '-'; }   // H = the 2D HUD pass
+    // H = the 2D HUD pass, M = one whole main-menu frame (EyeDiagMenuSec / EyeDiagDisconnect)
+    char EyeChar(int e) { return e == 1 ? 'L' : e == 2 ? 'R' : e == 3 ? 'H' : e == 4 ? 'M' : '-'; }
 
     // module+offset for a code address, or false if it is not in a module.
     bool GESVR_Where(const void *p, char *out, size_t n)
@@ -81,6 +84,12 @@ namespace {
         for (const char *k : kKeep)
             if (!_strnicmp(desc, k, strlen(k)))
                 return true;
+        // A menu frame (pass M) is drawn by VGUI, so there its modules count.
+        static const char *kMenu[] = { "GameUI.dll", "vgui2.dll", "vguimatsurface.dll" };
+        if (g_GESVR_EyePass == 4)
+            for (const char *k : kMenu)
+                if (!_strnicmp(desc, k, strlen(k)))
+                    return true;
         return false;
     }
 
@@ -117,6 +126,15 @@ void GESVR_EyeTraceNote(const char *text, const void *caller, bool withStack)
     Game::logMsg("EYETRACE %c %s  (called from %s)", EyeChar(g_GESVR_EyePass), text, where);
     if (withStack)
         GESVR_ScanStack();
+}
+
+// A line in vrmod_log with the caller and a filtered stack, trace or not.
+void GESVR_LogWithStack(const char *text, const void *caller)
+{
+    char where[200] = "?";
+    GESVR_Where(caller, where, sizeof(where));
+    Game::logMsg("%s  (called from %s)", text, where);
+    GESVR_ScanStack();
 }
 
 void GESVR_EyeTraceBeginPass(int eye, unsigned eyeW, unsigned eyeH)
@@ -1181,6 +1199,43 @@ GESVR_GuideDot g_GESVR_Guide[2][kGESVRGuideMax];
             m_device->StretchRect(m_right, nullptr, bb, &rightDest, D3DTEXF_LINEAR);
             bb->Release();
             return D3D_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE FillBackBufferFromEye(float u0, float v0, float u1, float v1)
+        {
+            if (!m_left)
+                return D3DERR_INVALIDCALL;
+            IDirect3DSurface9 *bb = nullptr;
+            HRESULT hr = m_device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb);
+            if (FAILED(hr) || !bb)
+                return FAILED(hr) ? hr : E_FAIL;
+            D3DSURFACE_DESC bd{}, ed{};
+            bb->GetDesc(&bd);
+            m_left->GetDesc(&ed);
+            // The biggest window-aspect rectangle inside the bounds, centred on
+            // them. The eye is ~square, so that is a full-width horizontal band.
+            const float x0 = u0 * ed.Width, x1 = u1 * ed.Width;
+            const float y0 = v0 * ed.Height, y1 = v1 * ed.Height;
+            const float want = float(bd.Width) / float(bd.Height);
+            float w = x1 - x0, h = y1 - y0;
+            if (w <= 1.0f || h <= 1.0f)
+            {
+                bb->Release();
+                return D3DERR_INVALIDCALL;
+            }
+            if (w / h > want)
+                w = h * want;
+            else
+                h = w / want;
+            const float cx = 0.5f * (x0 + x1), cy = 0.5f * (y0 + y1);
+            RECT src = { LONG(cx - 0.5f * w), LONG(cy - 0.5f * h), LONG(cx + 0.5f * w), LONG(cy + 0.5f * h) };
+            src.left = std::max<LONG>(src.left, 0);
+            src.top = std::max<LONG>(src.top, 0);
+            src.right = std::min<LONG>(src.right, LONG(ed.Width));
+            src.bottom = std::min<LONG>(src.bottom, LONG(ed.Height));
+            hr = m_device->StretchRect(m_left, &src, bb, nullptr, D3DTEXF_LINEAR);
+            bb->Release();
+            return hr;
         }
 
     private:

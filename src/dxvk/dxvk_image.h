@@ -303,6 +303,13 @@ namespace dxvk {
     }
 
     /**
+     * rief Backing memory (GESVR diagnostics: spotting aliased images)
+     */
+    const DxvkMemory& backingMemory() const {
+      return m_image.memory;
+    }
+
+    /**
      * \brief Get full subresource range of the image
      * 
      * \returns Resource range of the whole image

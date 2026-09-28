@@ -375,6 +375,15 @@ namespace dxvk {
   HRESULT STDMETHODCALLTYPE D3D9DeviceEx::Reset(D3DPRESENT_PARAMETERS* pPresentationParameters) {
     D3D9DeviceLock lock = LockDevice();
 
+    // GESVR: every device reset goes in vrmod_log, with who asked for it.
+    if (pPresentationParameters) {
+      char text[160];
+      snprintf(text, sizeof(text), "DXVK: device Reset to %ux%u, msaa %u, windowed %d",
+               pPresentationParameters->BackBufferWidth, pPresentationParameters->BackBufferHeight,
+               uint32_t(pPresentationParameters->MultiSampleType), int(pPresentationParameters->Windowed));
+      GESVR_LogWithStack(text, _ReturnAddress());
+    }
+
     HRESULT hr = ResetSwapChain(pPresentationParameters, nullptr);
     if (FAILED(hr))
       return hr;
@@ -1001,6 +1010,13 @@ namespace dxvk {
                   pDestRect ? pDestRect->left : 0, pDestRect ? pDestRect->top : 0,
                   pDestRect ? pDestRect->right : (LONG)de.width, pDestRect ? pDestRect->bottom : (LONG)de.height);
       GESVR_TraceState(lbl, _ReturnAddress(), false);
+      if (g_GESVR_EyePass == 4 && dst->GetCommonTexture()->GetImage() != nullptr) {
+        const DxvkMemory& m = dst->GetCommonTexture()->GetImage()->backingMemory();
+        char mem[96];
+        snprintf(mem, sizeof(mem), " dstmem=%llX+%llX/%llX",
+                 (unsigned long long)m.memory(), (unsigned long long)m.offset(), (unsigned long long)m.length());
+        GESVR_EyeTraceNote(mem, nullptr, false);
+      }
     }
 
     if (unlikely(src == dst))
@@ -1699,6 +1715,191 @@ namespace dxvk {
     }
     const bool scOn = m_state.renderStates[D3DRS_SCISSORTESTENABLE] != FALSE;
     GESVR_TraceRecord(what, caller, isDraw, rtW, rtH, m_state.viewport, m_state.scissorRect, scOn);
+
+    // Menu frames are a handful of draws, so each one gets its texture and
+    // blend state: enough to tell the background image from a black cover.
+    if (isDraw && g_GESVR_EyePass == 4) {
+      char buf[300];
+      uint32_t tw = 0, th = 0, tf = 0;
+      char texState[96] = "";
+      if (D3D9CommonTexture* tex = GetCommonTexture(m_state.textures[0])) {
+        tw = tex->Desc()->Width;
+        tf = uint32_t(tex->Desc()->Format);
+        th = tex->Desc()->Height;
+        // The CPU copy of mip 0, if there is one: all zero means the data
+        // itself is black; non-zero but drawn black means the GPU copy is stale.
+        uint32_t nonZero = 0, sampled = 0;
+        const DxvkBufferSliceHandle slice = tex->GetMappedSlice(0);
+        if (slice.mapPtr) {
+          const uint8_t* d = reinterpret_cast<const uint8_t*>(slice.mapPtr);
+          sampled = uint32_t(std::min<VkDeviceSize>(slice.length, 65536));
+          for (uint32_t i = 0; i < sampled; i++)
+            nonZero += d[i] != 0;
+        }
+        snprintf(texState, sizeof(texState), " managed=%d mapMode=%d upload=%d cpu=%u/%u",
+                 int(tex->IsManaged()), int(tex->GetMapMode()), int(tex->NeedsAnyUpload()), nonZero, sampled);
+        if (tex->GetImage() != nullptr) {
+          const DxvkMemory& m = tex->GetImage()->backingMemory();
+          char mem[96];
+          snprintf(mem, sizeof(mem), " texmem=%llX+%llX/%llX",
+                   (unsigned long long)m.memory(), (unsigned long long)m.offset(), (unsigned long long)m.length());
+          GESVR_EyeTraceNote(mem, nullptr, false);
+        }
+        if (g_GESVR_DiagForceUpload && tex->IsManaged() && slice.mapPtr) {
+          tex->SetAllNeedUpload();
+          m_activeTexturesToUpload |= 1u;
+          strcat_s(texState, " FORCED-REUPLOAD");
+        }
+      }
+      IDirect3DSurface9* bb = nullptr;
+      m_implicitSwapchain->GetBackBuffer(0, D3DBACKBUFFER_TYPE_MONO, &bb);
+      const bool toBackBuffer = bb && bb == static_cast<IDirect3DSurface9*>(m_state.renderTargets[0].ptr());
+      if (m_state.renderTargets[0] != nullptr && m_state.renderTargets[0]->GetCommonTexture()->GetImage() != nullptr) {
+        const DxvkMemory& m = m_state.renderTargets[0]->GetCommonTexture()->GetImage()->backingMemory();
+        char mem[96];
+        snprintf(mem, sizeof(mem), " rtmem=%llX+%llX/%llX",
+                 (unsigned long long)m.memory(), (unsigned long long)m.offset(), (unsigned long long)m.length());
+        GESVR_EyeTraceNote(mem, nullptr, false);
+      }
+      if (bb)
+        bb->Release();
+      snprintf(buf, sizeof(buf), "%s: %s tex0 %ux%u fmt=%u%s blend=%u src=%u dst=%u zfunc=%u",
+               what, toBackBuffer ? "BACKBUFFER" : "other-rt", tw, th, tf, texState,
+               uint32_t(m_state.renderStates[D3DRS_ALPHABLENDENABLE]),
+               uint32_t(m_state.renderStates[D3DRS_SRCBLEND]),
+               uint32_t(m_state.renderStates[D3DRS_DESTBLEND]),
+               uint32_t(m_state.renderStates[D3DRS_ZFUNC]));
+      // The 1x1 texture is VGUI's solid-colour fill: stack it, to see who paints it.
+      GESVR_EyeTraceNote(buf, caller, tw == 1 && th == 1);
+      // Pixel shader constants c0-c31 that are not all zero -- Source passes
+      // its tone-map scale this way, and a stale one draws a texture black.
+      char consts[900];
+      int n = 0;
+      for (uint32_t r = 0; r < 32 && n < int(sizeof(consts)) - 64; r++) {
+        const Vector4& c = m_state.psConsts.fConsts[r];
+        if (c.x == 0.0f && c.y == 0.0f && c.z == 0.0f && c.w == 0.0f)
+          continue;
+        n += snprintf(consts + n, sizeof(consts) - n, " c%u=(%.3g,%.3g,%.3g,%.3g)", r, c.x, c.y, c.z, c.w);
+      }
+      consts[n] = 0;
+      GESVR_EyeTraceNote(n ? consts : " no non-zero constants", nullptr, false);
+      // Vertex shader constants c0-c95 that are not all zero (texture
+      // transforms and the like live here).
+      {
+        char vsc[1400];
+        int m = 0;
+        for (uint32_t r = 0; r < 96 && m < int(sizeof(vsc)) - 64; r++) {
+          const Vector4& c = m_state.vsConsts.fConsts[r];
+          if (c.x == 0.0f && c.y == 0.0f && c.z == 0.0f && c.w == 0.0f)
+            continue;
+          m += snprintf(vsc + m, sizeof(vsc) - m, " v%u=(%.3g,%.3g,%.3g,%.3g)", r, c.x, c.y, c.z, c.w);
+        }
+        vsc[m] = 0;
+        GESVR_EyeTraceNote(m ? vsc : " no non-zero VS constants", nullptr, false);
+      }
+      // Everything else that could make a textured quad come out black.
+      const auto& ss = m_state.samplerStates[0];
+      const DWORD lod = m_state.textures[0] ? m_state.textures[0]->GetLOD() : 0;
+      char more[300];
+      snprintf(more, sizeof(more),
+               " ps=%p vs=%p lod=%lu | samp0 mag=%lu min=%lu mip=%lu maxmip=%lu bias=%08lX srgb=%lu addr=%lu/%lu"
+               " | srgbwrite=%lu colorwrite=%lX alphatest=%lu ref=%lu func=%lu blendop=%lu sepalpha=%lu fvf/decl=%p",
+               (void*)m_state.pixelShader.ptr(), (void*)m_state.vertexShader.ptr(), lod,
+               ss[D3DSAMP_MAGFILTER], ss[D3DSAMP_MINFILTER], ss[D3DSAMP_MIPFILTER], ss[D3DSAMP_MAXMIPLEVEL],
+               ss[D3DSAMP_MIPMAPLODBIAS], ss[D3DSAMP_SRGBTEXTURE], ss[D3DSAMP_ADDRESSU], ss[D3DSAMP_ADDRESSV],
+               m_state.renderStates[D3DRS_SRGBWRITEENABLE], m_state.renderStates[D3DRS_COLORWRITEENABLE],
+               m_state.renderStates[D3DRS_ALPHATESTENABLE], m_state.renderStates[D3DRS_ALPHAREF],
+               m_state.renderStates[D3DRS_ALPHAFUNC], m_state.renderStates[D3DRS_BLENDOP],
+               m_state.renderStates[D3DRS_SEPARATEALPHABLENDENABLE], (void*)m_state.vertexDecl.ptr());
+      GESVR_EyeTraceNote(more, nullptr, false);
+      {
+        char fog[200];
+        snprintf(fog, sizeof(fog), " fog enable=%lu color=%08lX table=%lu vertex=%lu range=%lu start=%.3g end=%.3g density=%.3g",
+                 m_state.renderStates[D3DRS_FOGENABLE], m_state.renderStates[D3DRS_FOGCOLOR],
+                 m_state.renderStates[D3DRS_FOGTABLEMODE], m_state.renderStates[D3DRS_FOGVERTEXMODE],
+                 m_state.renderStates[D3DRS_RANGEFOGENABLE],
+                 bit::cast<float>(m_state.renderStates[D3DRS_FOGSTART]),
+                 bit::cast<float>(m_state.renderStates[D3DRS_FOGEND]),
+                 bit::cast<float>(m_state.renderStates[D3DRS_FOGDENSITY]));
+        GESVR_EyeTraceNote(fog, nullptr, false);
+      }
+      // The pixel shader's bytecode: hashed into the log, written once per
+      // hash to %TEMP%\gesvr_ps_<hash>.bin for offline disassembly.
+      if (D3D9PixelShader* ps = m_state.pixelShader.ptr()) {
+        UINT size = 0;
+        if (SUCCEEDED(ps->GetFunction(nullptr, &size)) && size && size < 65536) {
+          std::vector<uint8_t> code(size);
+          if (SUCCEEDED(ps->GetFunction(code.data(), &size))) {
+            uint32_t h = 2166136261u;
+            for (uint8_t b : code) { h ^= b; h *= 16777619u; }
+            char path[MAX_PATH] = {};
+            GetTempPathA(MAX_PATH, path);
+            char name[40];
+            snprintf(name, sizeof(name), "gesvr_ps_%08X.bin", h);
+            strcat_s(path, name);
+            if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) {
+              if (FILE* f = fopen(path, "wb")) { fwrite(code.data(), 1, size, f); fclose(f); }
+            }
+            char line[80];
+            snprintf(line, sizeof(line), " pixel shader %08X, %u bytes", h, size);
+            GESVR_EyeTraceNote(line, nullptr, false);
+          }
+        }
+      }
+    }
+  }
+
+
+  // Menu-frame tracing (pass M): where a draw lands and in what colour, read
+  // straight from the vertices. VGUI draws screen-space quads with the colour
+  // in the vertex, so this tells a black cover from an image drawn invisible.
+  // Only directly-mapped (dynamic) buffers, which is what VGUI draws from.
+  void D3D9DeviceEx::GESVR_TraceMenuVerts(INT baseVertex, UINT minVertex, UINT numVertices) {
+    if (m_state.vertexDecl == nullptr)
+      return;
+    const D3DVERTEXELEMENT9 *pos = nullptr, *col = nullptr, *uv = nullptr;
+    for (const auto& e : m_state.vertexDecl->GetElements()) {
+      if (e.Usage == D3DDECLUSAGE_POSITION && e.UsageIndex == 0 && !pos) pos = &e;
+      if (e.Usage == D3DDECLUSAGE_COLOR && e.UsageIndex == 0 && !col) col = &e;
+      if (e.Usage == D3DDECLUSAGE_TEXCOORD && e.UsageIndex == 0 && !uv) uv = &e;
+    }
+    if (!pos || pos->Type != D3DDECLTYPE_FLOAT3)
+      return;
+    const D3D9VBO& vbo = m_state.vertexBuffers[pos->Stream];
+    D3D9CommonBuffer* buf = GetCommonBuffer(vbo.vertexBuffer);
+    if (!buf || buf->GetMapMode() != D3D9_COMMON_BUFFER_MAP_MODE_DIRECT || !vbo.stride)
+      return;
+    const uint8_t* data = reinterpret_cast<const uint8_t*>(buf->GetMappedSlice().mapPtr);
+    if (!data)
+      return;
+    const VkDeviceSize size = buf->Desc()->Size;
+    float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+    float u0 = 1e9f, v0 = 1e9f, u1 = -1e9f, v1 = -1e9f;
+    const bool haveUv = uv && uv->Stream == pos->Stream && uv->Type == D3DDECLTYPE_FLOAT2;
+    uint32_t firstColor = 0;
+    bool haveColor = false;
+    const UINT n = std::min(numVertices, 256u);
+    for (UINT i = 0; i < n; i++) {
+      const VkDeviceSize at = VkDeviceSize(vbo.offset) + VkDeviceSize(baseVertex + INT(minVertex + i)) * vbo.stride;
+      if (at + vbo.stride > size)
+        break;
+      const float* p = reinterpret_cast<const float*>(data + at + pos->Offset);
+      x0 = std::min(x0, p[0]); x1 = std::max(x1, p[0]);
+      y0 = std::min(y0, p[1]); y1 = std::max(y1, p[1]);
+      if (haveUv) {
+        const float* t = reinterpret_cast<const float*>(data + at + uv->Offset);
+        u0 = std::min(u0, t[0]); u1 = std::max(u1, t[0]);
+        v0 = std::min(v0, t[1]); v1 = std::max(v1, t[1]);
+      }
+      if (col && col->Stream == pos->Stream && !haveColor) {
+        firstColor = *reinterpret_cast<const uint32_t*>(data + at + col->Offset);
+        haveColor = true;
+      }
+    }
+    char text[200];
+    snprintf(text, sizeof(text), "  verts %u: x %.0f..%.0f y %.0f..%.0f color %s%08X uv %.3f..%.3f %.3f..%.3f",
+             numVertices, x0, x1, y0, y1, haveColor ? "" : "(none) ", firstColor, u0, u1, v0, v1);
+    GESVR_EyeTraceNote(text, nullptr, false);
   }
 
 
@@ -2541,6 +2742,8 @@ namespace dxvk {
           UINT             PrimitiveCount) {
     D3D9DeviceLock lock = LockDevice();
     GESVR_TRACE("draw", true);
+    if (unlikely(g_GESVR_EyeTrace && g_GESVR_EyePass == 4))
+      GESVR_TraceMenuVerts(BaseVertexIndex, MinVertexIndex, NumVertices);
 
     if (unlikely(m_state.vertexDecl == nullptr))
       return D3DERR_INVALIDCALL;
