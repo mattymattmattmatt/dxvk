@@ -13,8 +13,217 @@
 #include "L4D2VR/game.h"
 #include "L4D2VR/vr.h"
 #include "L4D2VR/vr_guide.h"
+#include "L4D2VR/vr_eyediag.h"
+
+#include <vector>
+#include <string>
+#include <intrin.h>
 
 namespace dxvk {
+
+// ---------------------------------------------------------------------------
+// Eye-pass tracing. See vr_eyediag.h for why this exists.
+// ---------------------------------------------------------------------------
+int  g_GESVR_EyePass = 0;
+bool g_GESVR_EyeTrace = false;
+
+namespace {
+    unsigned s_traceEyeW = 0, s_traceEyeH = 0;
+    int s_traceEvents = 0;
+
+    // Every distinct state a draw ran under in this pass, with a count. There
+    // are only ever a handful per pass, so a linear search is fine.
+    struct DrawState
+    {
+        uint32_t rtW, rtH;
+        DWORD vx, vy, vw, vh;
+        bool scOn;
+        LONG sl, st, sr, sb;
+        int n;
+    };
+    std::vector<DrawState> s_traceDraws;
+
+    char EyeChar(int e) { return e == 1 ? 'L' : e == 2 ? 'R' : e == 3 ? 'H' : '-'; }   // H = the 2D HUD pass
+
+    // module+offset for a code address, or false if it is not in a module.
+    bool GESVR_Where(const void *p, char *out, size_t n)
+    {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!p || !VirtualQuery(p, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT || !mbi.AllocationBase)
+            return false;
+        const DWORD prot = mbi.Protect & 0xFF;
+        if (!(prot == PAGE_EXECUTE || prot == PAGE_EXECUTE_READ ||
+              prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY))
+            return false;
+        char path[MAX_PATH] = {};
+        if (!GetModuleFileNameA((HMODULE)mbi.AllocationBase, path, MAX_PATH))
+            return false;
+        const char *base = strrchr(path, '\\');
+        base = base ? base + 1 : path;
+        _snprintf_s(out, n, _TRUNCATE, "%s+0x%X", base,
+                    (unsigned)((const char *)p - (const char *)mbi.AllocationBase));
+        return true;
+    }
+
+    // Who, in the ENGINE, caused this. The binaries omit frame pointers, so this
+    // scans the stack for anything that is a code address in a Source module --
+    // the same poor-man's unwind the watchdog uses. Our own frames and the OS
+    // are skipped; what is left is shaderapidx9 / materialsystem / engine /
+    // client, which is the part worth disassembling.
+    // Source's own modules only. The first scan kept everything that looked
+    // like code and was mostly stale words pointing into the NVIDIA driver,
+    // the IME and gameui -- never the engine frames that were wanted.
+    bool GESVR_IsSourceModule(const char *desc)
+    {
+        static const char *kKeep[] = { "engine.dll", "client.dll", "materialsystem.dll",
+                                       "shaderapidx9.dll", "stdshader_dx9.dll", "shadereditor.dll",
+                                       "game_shader_generic", "studiorender.dll" };
+        for (const char *k : kKeep)
+            if (!_strnicmp(desc, k, strlen(k)))
+                return true;
+        return false;
+    }
+
+    void GESVR_ScanStack()
+    {
+        NT_TIB *tib = reinterpret_cast<NT_TIB *>(NtCurrentTeb());
+        DWORD_PTR marker = 0;
+        DWORD_PTR *sp = &marker;
+        DWORD_PTR *top = reinterpret_cast<DWORD_PTR *>(tib->StackBase);
+        int printed = 0;
+        char desc[200], last[200] = "";
+        for (int i = 0; i < 4096 && sp + i < top && printed < 24; ++i)
+        {
+            DWORD_PTR v = 0;
+            __try { v = sp[i]; }
+            __except (EXCEPTION_EXECUTE_HANDLER) { break; }
+            if (!GESVR_Where(reinterpret_cast<const void *>(v), desc, sizeof(desc)))
+                continue;
+            if (!GESVR_IsSourceModule(desc) || !strcmp(desc, last))
+                continue;
+            strcpy_s(last, desc);
+            Game::logMsg("EYETRACE         stack [%02d] %s", printed++, desc);
+        }
+    }
+}
+
+void GESVR_EyeTraceNote(const char *text, const void *caller, bool withStack)
+{
+    if (!g_GESVR_EyeTrace || !g_GESVR_EyePass || s_traceEvents >= 160)
+        return;
+    ++s_traceEvents;
+    char where[200] = "?";
+    GESVR_Where(caller, where, sizeof(where));
+    Game::logMsg("EYETRACE %c %s  (called from %s)", EyeChar(g_GESVR_EyePass), text, where);
+    if (withStack)
+        GESVR_ScanStack();
+}
+
+void GESVR_EyeTraceBeginPass(int eye, unsigned eyeW, unsigned eyeH)
+{
+    g_GESVR_EyePass = eye;
+    s_traceEyeW = eyeW;
+    s_traceEyeH = eyeH;
+    s_traceEvents = 0;
+    s_traceDraws.clear();
+    if (g_GESVR_EyeTrace)
+        Game::logMsg("EYETRACE %c ===== BEGIN pass, target %ux%u =====", EyeChar(eye), eyeW, eyeH);
+}
+
+void GESVR_EyeTraceEndPass(int eye)
+{
+    if (g_GESVR_EyeTrace)
+    {
+        int total = 0, bad = 0;
+        for (const DrawState &d : s_traceDraws)
+        {
+            total += d.n;
+            const bool eyeRT = s_traceEyeW && d.rtW == s_traceEyeW && d.rtH == s_traceEyeH;
+            const bool vpShort = d.vx || d.vy || d.vw < d.rtW || d.vh < d.rtH;
+            const bool scShort = d.scOn && (d.sl > 0 || d.st > 0 || (uint32_t)d.sr < d.rtW || (uint32_t)d.sb < d.rtH);
+            if (eyeRT && (vpShort || scShort))
+                bad += d.n;
+            Game::logMsg("EYETRACE %c draws x%-5d rt=%ux%u%s vp=(%lu,%lu %lux%lu) scissor %s(%ld,%ld,%ld,%ld)%s",
+                         EyeChar(eye), d.n, d.rtW, d.rtH, eyeRT ? "[EYE]" : "",
+                         d.vx, d.vy, d.vw, d.vh, d.scOn ? "ON " : "off", d.sl, d.st, d.sr, d.sb,
+                         (eyeRT && (vpShort || scShort)) ? "  <-- does not cover the eye target" : "");
+        }
+        Game::logMsg("EYETRACE %c ===== END pass: %d draws, %d of them clipped short of the eye target =====",
+                     EyeChar(eye), total, bad);
+    }
+    g_GESVR_EyePass = 0;
+}
+
+// Called by D3D9DeviceEx::GESVR_TraceState with the device's live state.
+void GESVR_TraceRecord(const char *what, const void *caller, bool isDraw,
+                       uint32_t rtW, uint32_t rtH, const D3DVIEWPORT9 &vp, const RECT &sc, bool scOn)
+{
+    if (isDraw)
+    {
+        for (DrawState &d : s_traceDraws)
+        {
+            if (d.rtW == rtW && d.rtH == rtH && d.vx == vp.X && d.vy == vp.Y && d.vw == vp.Width &&
+                d.vh == vp.Height && d.scOn == scOn && d.sl == sc.left && d.st == sc.top &&
+                d.sr == sc.right && d.sb == sc.bottom)
+            {
+                ++d.n;
+                return;
+            }
+        }
+        if (s_traceDraws.size() < 64)
+            s_traceDraws.push_back({ rtW, rtH, vp.X, vp.Y, vp.Width, vp.Height, scOn,
+                                     sc.left, sc.top, sc.right, sc.bottom, 1 });
+        return;
+    }
+
+    if (s_traceEvents >= 160)
+        return;
+    ++s_traceEvents;
+    const bool eyeRT = s_traceEyeW && rtW == s_traceEyeW && rtH == s_traceEyeH;
+    const bool vpShort = vp.X || vp.Y || vp.Width < rtW || vp.Height < rtH;
+    const bool scShort = scOn && (sc.left > 0 || sc.top > 0 || (uint32_t)sc.right < rtW || (uint32_t)sc.bottom < rtH);
+    const bool suspect = eyeRT && (vpShort || scShort);
+    char where[200] = "?";
+    GESVR_Where(caller, where, sizeof(where));
+    Game::logMsg("EYETRACE %c %-22s rt=%ux%u%s vp=(%lu,%lu %lux%lu) scissor %s(%ld,%ld,%ld,%ld) by %s%s",
+                 EyeChar(g_GESVR_EyePass), what, rtW, rtH, eyeRT ? "[EYE]" : "",
+                 vp.X, vp.Y, vp.Width, vp.Height, scOn ? "ON " : "off",
+                 sc.left, sc.top, sc.right, sc.bottom, where,
+                 suspect ? "  <-- does not cover the eye target" : "");
+    if (suspect)
+        GESVR_ScanStack();
+}
+
+// 24-bit bottom-up BMP from a locked A8R8G8B8 / X8R8G8B8 surface.
+static bool GESVR_WriteBmp(const char *path, const uint8_t *bits, int pitch, int w, int h)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f)
+        return false;
+    const int row = (w * 3 + 3) & ~3;
+    const uint32_t imageSize = (uint32_t)row * (uint32_t)h;
+    uint8_t hdr[54] = { 'B', 'M' };
+    auto put32 = [&](int off, uint32_t v) { memcpy(hdr + off, &v, 4); };
+    auto put16 = [&](int off, uint16_t v) { memcpy(hdr + off, &v, 2); };
+    put32(2, 54 + imageSize); put32(10, 54); put32(14, 40);
+    put32(18, (uint32_t)w); put32(22, (uint32_t)h); put16(26, 1); put16(28, 24);
+    put32(34, imageSize);
+    fwrite(hdr, 1, 54, f);
+    std::vector<uint8_t> line(row, 0);
+    for (int y = h - 1; y >= 0; --y)
+    {
+        const uint8_t *src = bits + (size_t)y * pitch;
+        for (int x = 0; x < w; ++x)
+        {
+            line[x * 3 + 0] = src[x * 4 + 0];
+            line[x * 3 + 1] = src[x * 4 + 1];
+            line[x * 3 + 2] = src[x * 4 + 2];
+        }
+        fwrite(line.data(), 1, row, f);
+    }
+    fclose(f);
+    return true;
+}
 
 // Set from config: draw a VR aiming reticle into each eye.
 bool  g_GESVR_DrawReticle = true;
@@ -40,6 +249,41 @@ float g_GESVR_ReticleScale = 0.0007f;
 // comes out as a vertically stretched oval. Widening X by the surface aspect
 // cancels that. 0 = derive it from the surface; set a number to override.
 float g_GESVR_ReticleAspect = 0.0f;
+// The eye frustum's aspect (tan-width / tan-height), published by the mod. The
+// eye image of W x H pixels is shown across a frustum of this aspect, so a
+// pixel is (EyeAspect * H / W) as wide as it is tall and a circle needs its
+// horizontal radius multiplied by (W / H) / EyeAspect. The old factor was plain
+// W / H, which ignored the frustum: ~4% narrow on the window path (1.78 vs
+// 1.85) and on the eye-target path (0.96 vs 1.0). 0 = unknown, use W / H.
+float g_GESVR_EyeAspect = 0.0f;
+
+// Throw-guide dot radii are clamped in pixels, and those clamps were tuned on
+// 1440-row eye images. Scale them with the image so the guide looks the same
+// at any eye resolution -- per-eye targets roughly double the rows.
+static const float kGuideTunedRows = 1440.0f;
+
+} // namespace dxvk
+
+// Called from VR::Init once the HMD's projection is known.
+float GESVR_PublishEyeAspect(float a)
+{
+    dxvk::g_GESVR_EyeAspect = a;
+    return a;
+}
+
+namespace dxvk {
+
+static float GESVR_RoundFactor(UINT w, UINT h)
+{
+    if (g_GESVR_ReticleAspect > 0.0f)
+        return g_GESVR_ReticleAspect;
+    float ar = (h > 0) ? (float)w / (float)h : 1.0f;
+    if (g_GESVR_EyeAspect > 0.1f && g_GESVR_EyeAspect < 10.0f)
+        ar /= g_GESVR_EyeAspect;
+    if (ar < 0.25f) ar = 0.25f;
+    if (ar > 4.0f)  ar = 4.0f;
+    return ar;
+}
 // 0 = cross, 1 = dot, 2 = ring, 3 = ring + dot. A dot is far less intrusive at
 // the centre of view.
 int   g_GESVR_ReticleStyle = 1;
@@ -215,6 +459,71 @@ GESVR_GuideDot g_GESVR_Guide[2][kGESVRGuideMax];
             return D3D_OK;
         }
 
+        // Two-phase eye snapshot; see the interface. Each eye is first scaled
+        // into a small render target so the system-memory copies stay a few MB
+        // -- full-size copies of both eyes would be ~60 MB in a process that is
+        // already short of address space.
+        HRESULT STDMETHODCALLTYPE DiagEyeDumpIssue(UINT maxWidth)
+        {
+            IDirect3DSurface9 *src[2] = { m_left, m_right };
+            HRESULT res[2] = { E_FAIL, E_FAIL };
+            for (int e = 0; e < 2; ++e)
+            {
+                if (m_diagRT[e])  { m_diagRT[e]->Release();  m_diagRT[e] = nullptr; }
+                if (m_diagMem[e]) { m_diagMem[e]->Release(); m_diagMem[e] = nullptr; }
+                if (!src[e])
+                    continue;
+                D3DSURFACE_DESC d{};
+                if (FAILED(src[e]->GetDesc(&d)) || d.Width == 0 || d.Height == 0)
+                    continue;
+                UINT w = d.Width, h = d.Height;
+                if (maxWidth && w > maxWidth) { h = (UINT)((unsigned long long)h * maxWidth / w); w = maxWidth; }
+                if (d.Format != D3DFMT_A8R8G8B8 && d.Format != D3DFMT_X8R8G8B8)
+                {
+                    Game::logMsg("EYEDUMP eye %d format %d is not 8888; skipped", e, (int)d.Format);
+                    continue;
+                }
+                HRESULT hr = m_device->CreateRenderTarget(w, h, d.Format, D3DMULTISAMPLE_NONE, 0, FALSE, &m_diagRT[e], nullptr);
+                if (SUCCEEDED(hr))
+                    hr = m_device->StretchRect(src[e], nullptr, m_diagRT[e], nullptr, D3DTEXF_LINEAR);
+                if (SUCCEEDED(hr))
+                    hr = m_device->CreateOffscreenPlainSurface(w, h, d.Format, D3DPOOL_SYSTEMMEM, &m_diagMem[e], nullptr);
+                if (SUCCEEDED(hr))
+                    hr = m_device->GetRenderTargetData(m_diagRT[e], m_diagMem[e]);
+                res[e] = hr;
+                Game::logMsg("EYEDUMP eye %d source %ux%u -> %ux%u queued hr=0x%08X",
+                             e, d.Width, d.Height, w, h, (unsigned)hr);
+            }
+            return SUCCEEDED(res[0]) && SUCCEEDED(res[1]) ? D3D_OK : E_FAIL;
+        }
+
+        HRESULT STDMETHODCALLTYPE DiagEyeDumpWrite(const char *pathPrefix)
+        {
+            static const char *kSide[2] = { "L", "R" };
+            for (int e = 0; e < 2; ++e)
+            {
+                if (!m_diagMem[e])
+                    continue;
+                D3DSURFACE_DESC d{};
+                m_diagMem[e]->GetDesc(&d);
+                D3DLOCKED_RECT lr{};
+                HRESULT hr = m_diagMem[e]->LockRect(&lr, nullptr, D3DLOCK_READONLY);
+                if (SUCCEEDED(hr))
+                {
+                    std::string path = std::string(pathPrefix) + "_" + kSide[e] + ".bmp";
+                    const bool ok = GESVR_WriteBmp(path.c_str(), (const uint8_t *)lr.pBits, lr.Pitch,
+                                                   (int)d.Width, (int)d.Height);
+                    m_diagMem[e]->UnlockRect();
+                    Game::logMsg("EYEDUMP wrote %s (%ux%u) %s", path.c_str(), d.Width, d.Height, ok ? "ok" : "FAILED");
+                }
+                else
+                    Game::logMsg("EYEDUMP eye %d LockRect failed 0x%08X", e, (unsigned)hr);
+                m_diagMem[e]->Release(); m_diagMem[e] = nullptr;
+                if (m_diagRT[e]) { m_diagRT[e]->Release(); m_diagRT[e] = nullptr; }
+            }
+            return D3D_OK;
+        }
+
         HRESULT STDMETHODCALLTYPE WaitDeviceIdle()
         {
             m_device->Flush();
@@ -333,11 +642,7 @@ GESVR_GuideDot g_GESVR_Guide[2][kGESVRGuideMax];
                     if (th < 1) th = 1;
                     const int ci = g_GESVR_ReticleColor;
                     const D3DCOLOR col = kReticleColors[(ci >= 0 && ci < 5) ? ci : 0];
-                    float ar = g_GESVR_ReticleAspect;
-                    if (ar <= 0.0f)
-                        ar = (dd.Height > 0) ? ((float)dd.Width / (float)dd.Height) : 1.0f;
-                    if (ar < 0.25f) ar = 0.25f;
-                    if (ar > 4.0f)  ar = 4.0f;
+                    const float ar = GESVR_RoundFactor(dd.Width, dd.Height);
 
                     // ColorFill only draws rectangles, so round shapes are built
                     // from one fill per scanline. Horizontal radii are widened by
@@ -473,11 +778,8 @@ GESVR_GuideDot g_GESVR_Guide[2][kGESVRGuideMax];
                 D3DSURFACE_DESC gd{};
                 if (count > 0 && SUCCEEDED(dest->GetDesc(&gd)) && gd.Width > 32 && gd.Height > 32)
                 {
-                    float gar = g_GESVR_ReticleAspect;
-                    if (gar <= 0.0f)
-                        gar = (float)gd.Width / (float)gd.Height;
-                    if (gar < 0.25f) gar = 0.25f;
-                    if (gar > 4.0f)  gar = 4.0f;
+                    const float gar = GESVR_RoundFactor(gd.Width, gd.Height);
+                    const float rowScale = (float)gd.Height / kGuideTunedRows;
                     const int ci = g_GESVR_ReticleColor;
                     const D3DCOLOR cols[3] = { kReticleColors[(ci >= 0 && ci < 5) ? ci : 0],
                                                D3DCOLOR_ARGB(255, 115, 115, 115),
@@ -495,8 +797,8 @@ GESVR_GuideDot g_GESVR_Guide[2][kGESVRGuideMax];
                         if (cx < -8 || cy < -8 || cx > gw + 8 || cy > gh + 8)
                             continue;
                         float r = d.r * (float)gh;
-                        if (r < 0.55f) r = 0.55f;
-                        if (r > 4.5f) r = 4.5f;
+                        if (r < 0.55f * rowScale) r = 0.55f * rowScale;
+                        if (r > 4.5f * rowScale) r = 4.5f * rowScale;
                         const D3DCOLOR col = cols[(d.c >= 0 && d.c < 3) ? d.c : 0];
                         if (r < 1.6f)
                         {
@@ -893,6 +1195,8 @@ GESVR_GuideDot g_GESVR_Guide[2][kGESVRGuideMax];
         IDirect3DSurface9 *m_black = nullptr;
         IDirect3DSurface9 *m_overlay = nullptr;
         IDirect3DSurface9 *m_sbs = nullptr;
+        IDirect3DSurface9 *m_diagRT[2] = { nullptr, nullptr };    // DiagEyeDump only
+        IDirect3DSurface9 *m_diagMem[2] = { nullptr, nullptr };
         IDirect3DStateBlock9 *m_alphaSB = nullptr;
         bool m_alphaSBFailed = false;
         UINT m_eyeW = 0;
@@ -902,6 +1206,15 @@ GESVR_GuideDot g_GESVR_Guide[2][kGESVRGuideMax];
         UINT m_sbsW = 0;
         UINT m_sbsH = 0;
     };
+
+void GESVR_EyeTraceSnapshot(const char *label)
+{
+    if (!g_GESVR_EyeTrace || !g_D3DVR9)
+        return;
+    IDirect3DDevice9 *dev = g_D3DVR9->GetD3DDevice();
+    if (dev)
+        static_cast<D3D9DeviceEx *>(dev)->GESVR_TraceState(label, _ReturnAddress(), false);
+}
 
 }
 

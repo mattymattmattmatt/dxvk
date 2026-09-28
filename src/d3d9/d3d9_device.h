@@ -897,6 +897,9 @@ namespace dxvk {
 
     void FlushImplicit(BOOL StrongHint);
 
+    // GESVR eye-pass tracing (L4D2VR/vr_eyediag.h).
+    void GESVR_TraceState(const char *what, const void *caller, bool isDraw);
+
     bool ChangeReportedMemory(int64_t delta) {
       if (IsExtended())
         return true;

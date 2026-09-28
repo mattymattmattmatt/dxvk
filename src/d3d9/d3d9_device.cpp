@@ -27,7 +27,21 @@
 #include "L4D2VR/game.h"
 #include "L4D2VR/vr.h"
 #include "L4D2VR/sdk/sdk.h"
+#include "L4D2VR/vr_eyediag.h"
 #include "d3d9_vr.h"
+
+#include <intrin.h>
+
+namespace dxvk {
+  // d3d9_vr.cpp. Takes D3D types, so it is declared here rather than in the
+  // mod-facing vr_eyediag.h.
+  void GESVR_TraceRecord(const char *what, const void *caller, bool isDraw,
+                         uint32_t rtW, uint32_t rtH, const D3DVIEWPORT9 &vp, const RECT &sc, bool scOn);
+}
+
+// One load and one branch outside a traced eye pass.
+#define GESVR_TRACE(what, isDraw) \
+  do { if (unlikely(g_GESVR_EyeTrace && g_GESVR_EyePass)) GESVR_TraceState(what, _ReturnAddress(), isDraw); } while (0)
 
 #include <algorithm>
 #include <cfloat>
@@ -974,6 +988,21 @@ namespace dxvk {
     if (unlikely(src == nullptr || dst == nullptr))
       return D3DERR_INVALIDCALL;
 
+    if (unlikely(g_GESVR_EyeTrace && g_GESVR_EyePass)) {
+      const auto se = src->GetSurfaceExtent();
+      const auto de = dst->GetSurfaceExtent();
+      char lbl[160];
+      _snprintf_s(lbl, sizeof(lbl), _TRUNCATE,
+                  "StretchRect %ux%u(%ld,%ld,%ld,%ld)->%ux%u(%ld,%ld,%ld,%ld)",
+                  se.width, se.height,
+                  pSourceRect ? pSourceRect->left : 0, pSourceRect ? pSourceRect->top : 0,
+                  pSourceRect ? pSourceRect->right : (LONG)se.width, pSourceRect ? pSourceRect->bottom : (LONG)se.height,
+                  de.width, de.height,
+                  pDestRect ? pDestRect->left : 0, pDestRect ? pDestRect->top : 0,
+                  pDestRect ? pDestRect->right : (LONG)de.width, pDestRect ? pDestRect->bottom : (LONG)de.height);
+      GESVR_TraceState(lbl, _ReturnAddress(), false);
+    }
+
     if (unlikely(src == dst))
       return D3DERR_INVALIDCALL;
 
@@ -1311,8 +1340,11 @@ namespace dxvk {
       }
     }
 
-    if (m_state.renderTargets[RenderTargetIndex] == rt)
+    if (m_state.renderTargets[RenderTargetIndex] == rt) {
+      if (RenderTargetIndex == 0)
+        GESVR_TRACE("SetRenderTarget0 (same)", false);
       return D3D_OK;
+    }
 
     // Do a strong flush if the first render target is changed.
     FlushImplicit(RenderTargetIndex == 0 ? TRUE : FALSE);
@@ -1348,6 +1380,8 @@ namespace dxvk {
 
         m_flags.set(D3D9DeviceFlag::DirtyMultiSampleState);
       }
+
+      GESVR_TRACE("SetRenderTarget0", false);
     }
 
     return D3D_OK;
@@ -1459,6 +1493,11 @@ namespace dxvk {
       return D3D_OK;
 
     D3D9DeviceLock lock = LockDevice();
+    if (unlikely(g_GESVR_EyeTrace && g_GESVR_EyePass)) {
+      char lbl[64];
+      _snprintf_s(lbl, sizeof(lbl), _TRUNCATE, "Clear f=0x%lX rects=%lu", (unsigned long)Flags, (unsigned long)Count);
+      GESVR_TraceState(lbl, _ReturnAddress(), false);
+    }
 
     const auto& vp = m_state.viewport;
     const auto& sc = m_state.scissorRect;
@@ -1649,14 +1688,30 @@ namespace dxvk {
   }
 
 
+  // GESVR eye-pass tracing: hand the live state to d3d9_vr.cpp. Only reached
+  // through GESVR_TRACE, i.e. inside a traced eye pass.
+  void D3D9DeviceEx::GESVR_TraceState(const char *what, const void *caller, bool isDraw) {
+    uint32_t rtW = 0, rtH = 0;
+    if (m_state.renderTargets[0] != nullptr) {
+      auto e = m_state.renderTargets[0]->GetSurfaceExtent();
+      rtW = e.width;
+      rtH = e.height;
+    }
+    const bool scOn = m_state.renderStates[D3DRS_SCISSORTESTENABLE] != FALSE;
+    GESVR_TraceRecord(what, caller, isDraw, rtW, rtH, m_state.viewport, m_state.scissorRect, scOn);
+  }
+
+
   HRESULT STDMETHODCALLTYPE D3D9DeviceEx::SetViewport(const D3DVIEWPORT9* pViewport) {
     D3D9DeviceLock lock = LockDevice();
 
     if (unlikely(ShouldRecord()))
       return m_recorder->SetViewport(pViewport);
 
-    if (m_state.viewport == *pViewport)
+    if (m_state.viewport == *pViewport) {
+      GESVR_TRACE("SetViewport (same)", false);
       return D3D_OK;
+    }
 
     m_state.viewport = *pViewport;
 
@@ -1664,6 +1719,7 @@ namespace dxvk {
     m_flags.set(D3D9DeviceFlag::DirtyFFViewport);
     m_flags.set(D3D9DeviceFlag::DirtyPointScale);
 
+    GESVR_TRACE("SetViewport", false);
     return D3D_OK;
   }
 
@@ -2013,6 +2069,7 @@ namespace dxvk {
 
         case D3DRS_SCISSORTESTENABLE:
           m_flags.set(D3D9DeviceFlag::DirtyViewportScissor);
+          GESVR_TRACE(Value ? "ScissorTest ON" : "ScissorTest off", false);
           break;
 
         case D3DRS_SRGBWRITEENABLE:
@@ -2386,13 +2443,16 @@ namespace dxvk {
     if (unlikely(ShouldRecord()))
       return m_recorder->SetScissorRect(pRect);
 
-    if (m_state.scissorRect == *pRect)
+    if (m_state.scissorRect == *pRect) {
+      GESVR_TRACE("SetScissorRect (same)", false);
       return D3D_OK;
+    }
 
     m_state.scissorRect = *pRect;
 
     m_flags.set(D3D9DeviceFlag::DirtyViewportScissor);
 
+    GESVR_TRACE("SetScissorRect", false);
     return D3D_OK;
   }
 
@@ -2443,6 +2503,7 @@ namespace dxvk {
           UINT             StartVertex,
           UINT             PrimitiveCount) {
     D3D9DeviceLock lock = LockDevice();
+    GESVR_TRACE("draw", true);
 
     if (unlikely(m_state.vertexDecl == nullptr))
       return D3DERR_INVALIDCALL;
@@ -2479,6 +2540,7 @@ namespace dxvk {
           UINT             StartIndex,
           UINT             PrimitiveCount) {
     D3D9DeviceLock lock = LockDevice();
+    GESVR_TRACE("draw", true);
 
     if (unlikely(m_state.vertexDecl == nullptr))
       return D3DERR_INVALIDCALL;
@@ -2515,6 +2577,7 @@ namespace dxvk {
     const void*            pVertexStreamZeroData,
           UINT             VertexStreamZeroStride) {
     D3D9DeviceLock lock = LockDevice();
+    GESVR_TRACE("draw", true);
 
     if (unlikely(m_state.vertexDecl == nullptr))
       return D3DERR_INVALIDCALL;
@@ -2568,6 +2631,7 @@ namespace dxvk {
     const void*            pVertexStreamZeroData,
           UINT             VertexStreamZeroStride) {
     D3D9DeviceLock lock = LockDevice();
+    GESVR_TRACE("draw", true);
 
     if (unlikely(m_state.vertexDecl == nullptr))
         return D3DERR_INVALIDCALL;

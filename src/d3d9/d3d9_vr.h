@@ -56,6 +56,14 @@ IDirect3DVR9 : public IUnknown{
   // 2 GB address space during map loads. Recreated on demand by the next
   // capture. The caller must have stopped submitting them first.
   virtual HRESULT STDMETHODCALLTYPE ReleaseEyeSurfaces() = 0;
+  // Diagnostics: snapshot both eye images to disk, in two halves so it never
+  // blocks. Issue queues a GPU copy of each eye into system memory and returns
+  // at once; Write, called many frames later, reads them back (the copy has
+  // long finished, so the wait is already satisfied) and writes BMPs.
+  // A synchronous readback here froze the game once already -- do not fold
+  // these into one call.
+  virtual HRESULT STDMETHODCALLTYPE DiagEyeDumpIssue(UINT maxWidth) = 0;
+  virtual HRESULT STDMETHODCALLTYPE DiagEyeDumpWrite(const char *pathPrefix) = 0;
 };
 
 #ifdef _MSC_VER
