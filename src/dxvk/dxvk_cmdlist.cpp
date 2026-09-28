@@ -1,5 +1,12 @@
+#include <atomic>
+#include <chrono>
+#include <thread>
+
 #include "dxvk_cmdlist.h"
 #include "dxvk_device.h"
+
+// GESVR: d3d9_vr.cpp, set through config FakeSubmitOOM (L4D2VR/vr.h).
+extern std::atomic<int> g_GESVR_FakeSubmitOOM;
 
 namespace dxvk {
     
@@ -203,8 +210,40 @@ namespace dxvk {
     submitInfo.pCommandBuffers      = info.cmdBuffers;
     submitInfo.signalSemaphoreCount = info.wakeCount;
     submitInfo.pSignalSemaphores    = info.wakeSync;
-    
-    return m_vkd->vkQueueSubmit(queue, 1, &submitInfo, fence);
+
+    auto queueSubmit = [&] () -> VkResult {
+      // GESVR_FakeSubmitOOM test hook: fail without reaching the driver.
+      int fake = g_GESVR_FakeSubmitOOM.load();
+      while (fake > 0) {
+        if (g_GESVR_FakeSubmitOOM.compare_exchange_weak(fake, fake - 1))
+          return VK_ERROR_OUT_OF_HOST_MEMORY;
+      }
+      return m_vkd->vkQueueSubmit(queue, 1, &submitInfo, fence);
+    };
+
+    VkResult status = queueSubmit();
+
+    // GESVR: hl2.exe is a 32-bit process with 2 GB of address space, and a map
+    // load takes it to within ~100 MB of the ceiling while the pipeline
+    // compilers hold large temporary allocations. A submit that fails for
+    // memory then is likely to succeed a moment later, and the spec makes the
+    // retry safe: on OUT_OF_*_MEMORY vkQueueSubmit must leave every resource,
+    // fence and semaphore it references untouched (anything it cannot undo is
+    // reported as DEVICE_LOST instead). Retrying HERE, per vkQueueSubmit, keeps
+    // a two-queue submission from re-sending the half that already went.
+    // Up to ~2 s; the queue lock is held throughout, which stalls the OpenVR
+    // submit on the render thread for that long and nothing worse.
+    for (uint32_t attempt = 1; attempt <= 40
+        && (status == VK_ERROR_OUT_OF_HOST_MEMORY || status == VK_ERROR_OUT_OF_DEVICE_MEMORY); attempt++) {
+      if (attempt == 1)
+        Logger::warn(str::format("DxvkCommandList: vkQueueSubmit out of memory (", status, "), retrying"));
+      std::this_thread::sleep_for(std::chrono::milliseconds(attempt < 10 ? 10 : 50));
+      status = queueSubmit();
+      if (status == VK_SUCCESS)
+        Logger::warn(str::format("DxvkCommandList: vkQueueSubmit succeeded on retry ", attempt));
+    }
+
+    return status;
   }
   
   void DxvkCommandList::cmdBeginDebugUtilsLabel(VkDebugUtilsLabelEXT *pLabelInfo) {

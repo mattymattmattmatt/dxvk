@@ -1,6 +1,10 @@
 #include "dxvk_device.h"
 #include "dxvk_queue.h"
 
+// GESVR: defined in d3d9_vr.cpp. Logs an unrecoverable GPU error to
+// vrmod_log.txt and ends the process; does not return.
+void GESVR_DxvkFatal(const char* what, int vkResult);
+
 namespace dxvk {
   
   DxvkSubmissionQueue::DxvkSubmissionQueue(DxvkDevice* device)
@@ -128,7 +132,17 @@ namespace dxvk {
       } else if (status == VK_ERROR_DEVICE_LOST || entry.submit.cmdList != nullptr) {
         Logger::err(str::format("DxvkSubmissionQueue: Command submission failed: ", status));
         m_lastError = status;
-        m_device->waitForIdle();
+        // GESVR: this used to call m_device->waitForIdle(), which goes through
+        // synchronize(): that takes m_mutex -- held by this thread right here
+        // -- and waits for m_submitQueue to empty, which only this thread
+        // does. So any failed submit froze both queue threads and then the
+        // game (seen twice on 2026-09-28, loading into a map). A dropped
+        // command list would hang the game anyway: its queries and resources
+        // are never signalled. End the process with the reason in vrmod_log
+        // instead of leaving a frozen headset.
+        lock.unlock();
+        GESVR_DxvkFatal("vkQueueSubmit", status);
+        lock.lock();
       }
 
       m_submitQueue.pop();
@@ -168,6 +182,9 @@ namespace dxvk {
       if (status != VK_SUCCESS) {
         Logger::err(str::format("DxvkSubmissionQueue: Failed to sync fence: ", status));
         m_lastError = status;
+        // GESVR: see submitCmdLists. The device is gone; waiting for it here
+        // only parks this thread behind the submit thread's deadlock.
+        GESVR_DxvkFatal("vkWaitForFences", status);
         m_device->waitForIdle();
       }
 

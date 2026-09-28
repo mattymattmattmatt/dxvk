@@ -2,6 +2,11 @@
 
 #include "../util_env.h"
 
+// GESVR: defined in d3d9_vr.cpp. Copies a warning or error into vrmod_log.txt,
+// which is appended to across launches; hl2_d3d9.log is truncated at every
+// start, so the error behind a failed launch was gone by the time anyone looked.
+void GESVR_DxvkLogLine(const char* prefix, const char* line);
+
 namespace dxvk {
   
   Logger::Logger(const std::string& file_name)
@@ -50,22 +55,27 @@ namespace dxvk {
   
   void Logger::emitMsg(LogLevel level, const std::string& message) {
     if (level >= m_minLevel) {
-      std::lock_guard<dxvk::mutex> lock(m_mutex);
-      
       static std::array<const char*, 5> s_prefixes
         = {{ "trace: ", "debug: ", "info:  ", "warn:  ", "err:   " }};
-      
+
       const char* prefix = s_prefixes.at(static_cast<uint32_t>(level));
 
-      std::stringstream stream(message);
-      std::string       line;
+      { std::lock_guard<dxvk::mutex> lock(m_mutex);
 
-      while (std::getline(stream, line, '\n')) {
-        std::cerr << prefix << line << std::endl;
+        std::stringstream stream(message);
+        std::string       line;
 
-        if (m_fileStream)
-          m_fileStream << prefix << line << std::endl;
+        while (std::getline(stream, line, '\n')) {
+          std::cerr << prefix << line << std::endl;
+
+          if (m_fileStream)
+            m_fileStream << prefix << line << std::endl;
+        }
       }
+
+      // Outside our lock: the mod's log has its own.
+      if (level >= LogLevel::Warn)
+        GESVR_DxvkLogLine(prefix, message.c_str());
     }
   }
   

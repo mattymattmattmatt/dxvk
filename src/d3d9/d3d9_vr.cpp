@@ -271,6 +271,57 @@ float GESVR_PublishEyeAspect(float a)
     return a;
 }
 
+// FakeSubmitOOM test hook (vr_eyediag.h): submits still to fail on purpose.
+std::atomic<int> g_GESVR_FakeSubmitOOM{ 0 };
+
+void GESVR_FakeSubmitOOM(int n)
+{
+    g_GESVR_FakeSubmitOOM.store(n);
+}
+
+// DXVK's warnings and errors, copied into vrmod_log.txt (util/log/log.cpp).
+// Capped: this DXVK warns a handful of times per launch, so hitting the cap
+// means something is repeating and the first lines are the ones that matter.
+void GESVR_DxvkLogLine(const char *prefix, const char *line)
+{
+    static std::atomic<int> s_lines{ 0 };
+    const int n = s_lines.fetch_add(1);
+    if (n < 300)
+        Game::logMsg("DXVK %s%s", prefix, line);
+    else if (n == 300)
+        Game::logMsg("DXVK: 300 warnings/errors logged; the rest are in hl2_d3d9.log");
+}
+
+// A queue thread hit a GPU error it cannot come back from (dxvk_queue.cpp).
+// Before this, DXVK froze in its own error handling and the game froze with it,
+// which in the headset is a hung image until the player finds Task Manager.
+// Ending the process says why and lets them relaunch straight away.
+void GESVR_DxvkFatal(const char *what, int vkResult)
+{
+    const char *name = vkResult == -1 ? "out of host memory (in this 32-bit process, usually address space)"
+                     : vkResult == -2 ? "out of device memory"
+                     : vkResult == -4 ? "device lost"
+                     : "unexpected error";
+    MEMORYSTATUSEX ms{}; ms.dwLength = sizeof(ms);
+    GlobalMemoryStatusEx(&ms);
+    const unsigned usedMB = (unsigned)((ms.ullTotalVirtual - ms.ullAvailVirtual) >> 20);
+    // The whole-address-space walk is too slow for every frame but fine here.
+    SIZE_T hole = 0;
+    MEMORY_BASIC_INFORMATION mbi;
+    for (uintptr_t p = 0x10000; p < 0x7FFF0000u && VirtualQuery((LPCVOID)p, &mbi, sizeof(mbi)) == sizeof(mbi);
+         p = (uintptr_t)mbi.BaseAddress + mbi.RegionSize)
+    {
+        if (mbi.State == MEM_FREE && mbi.RegionSize > hole)
+            hole = mbi.RegionSize;
+    }
+    Game::logMsg("DXVK FATAL: %s returned VkResult %d, %s. Address space %u of %u MB in use, "
+                 "largest free block %u MB, in map %d. The GPU queue cannot recover from this, "
+                 "so the game is being closed instead of left frozen.",
+                 what, vkResult, name, usedMB, (unsigned)(ms.ullTotalVirtual >> 20),
+                 (unsigned)(hole >> 20), (int)GESVRMem::g_inMap.load());
+    TerminateProcess(GetCurrentProcess(), 0xE0DE0000u | (unsigned)(-vkResult & 0xFF));
+}
+
 namespace dxvk {
 
 static float GESVR_RoundFactor(UINT w, UINT h)
@@ -465,9 +516,15 @@ GESVR_GuideDot g_GESVR_Guide[2][kGESVRGuideMax];
         // already short of address space.
         HRESULT STDMETHODCALLTYPE DiagEyeDumpIssue(UINT maxWidth)
         {
-            IDirect3DSurface9 *src[2] = { m_left, m_right };
-            HRESULT res[2] = { E_FAIL, E_FAIL };
-            for (int e = 0; e < 2; ++e)
+            // [2] is the menu overlay surface -- what the floating menu panel
+            // shows -- so a broken menu can be looked at, not just the eyes.
+            // [3] is the backbuffer as it is at the moment of the call -- right
+            // after the HUD pass when called from the end of dRenderView.
+            IDirect3DSurface9 *bbNow = nullptr;
+            m_device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bbNow);
+            IDirect3DSurface9 *src[4] = { m_left, m_right, m_overlay, bbNow };
+            HRESULT res[4] = { E_FAIL, E_FAIL, E_FAIL, E_FAIL };
+            for (int e = 0; e < 4; ++e)
             {
                 if (m_diagRT[e])  { m_diagRT[e]->Release();  m_diagRT[e] = nullptr; }
                 if (m_diagMem[e]) { m_diagMem[e]->Release(); m_diagMem[e] = nullptr; }
@@ -494,13 +551,15 @@ GESVR_GuideDot g_GESVR_Guide[2][kGESVRGuideMax];
                 Game::logMsg("EYEDUMP eye %d source %ux%u -> %ux%u queued hr=0x%08X",
                              e, d.Width, d.Height, w, h, (unsigned)hr);
             }
+            if (bbNow)
+                bbNow->Release();
             return SUCCEEDED(res[0]) && SUCCEEDED(res[1]) ? D3D_OK : E_FAIL;
         }
 
         HRESULT STDMETHODCALLTYPE DiagEyeDumpWrite(const char *pathPrefix)
         {
-            static const char *kSide[2] = { "L", "R" };
-            for (int e = 0; e < 2; ++e)
+            static const char *kSide[4] = { "L", "R", "O", "B" };
+            for (int e = 0; e < 4; ++e)
             {
                 if (!m_diagMem[e])
                     continue;
@@ -1184,7 +1243,12 @@ GESVR_GuideDot g_GESVR_Guide[2][kGESVRGuideMax];
 
             m_eyeW = desc.Width;
             m_eyeH = desc.Height;
-            Game::logMsg("Stereo D3D RTs created %ux%u fmt=%d", m_eyeW, m_eyeH, (int)fmt);
+            {
+                MEMORYSTATUSEX ms{}; ms.dwLength = sizeof(ms);
+                GlobalMemoryStatusEx(&ms);
+                Game::logMsg("Stereo D3D RTs created %ux%u fmt=%d (address space now %u MB used)", m_eyeW, m_eyeH, (int)fmt,
+                             (unsigned)((ms.ullTotalVirtual - ms.ullAvailVirtual) >> 20));
+            }
             return D3D_OK;
         }
 
@@ -1195,8 +1259,8 @@ GESVR_GuideDot g_GESVR_Guide[2][kGESVRGuideMax];
         IDirect3DSurface9 *m_black = nullptr;
         IDirect3DSurface9 *m_overlay = nullptr;
         IDirect3DSurface9 *m_sbs = nullptr;
-        IDirect3DSurface9 *m_diagRT[2] = { nullptr, nullptr };    // DiagEyeDump only
-        IDirect3DSurface9 *m_diagMem[2] = { nullptr, nullptr };
+        IDirect3DSurface9 *m_diagRT[4] = { nullptr, nullptr, nullptr, nullptr };    // DiagEyeDump only
+        IDirect3DSurface9 *m_diagMem[4] = { nullptr, nullptr, nullptr, nullptr };
         IDirect3DStateBlock9 *m_alphaSB = nullptr;
         bool m_alphaSBFailed = false;
         UINT m_eyeW = 0;
