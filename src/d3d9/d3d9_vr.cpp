@@ -35,6 +35,7 @@ float g_GESVR_ScopeV[2] = { 0.5f, 0.5f };
 float g_GESVR_ScopeR[2] = { 0.0f, 0.0f };
 float g_GESVR_ScopeA[2][2] = { { 0.0f, 0.0f }, { 0.0f, 0.0f } };
 float g_GESVR_ScopeB[2][2] = { { 0.0f, 0.0f }, { 0.0f, 0.0f } };
+float g_GESVR_ScopeCross[4] = { 0.0f, -1.0f, 1.0f, 0.0f };
 
 namespace {
     unsigned s_traceEyeW = 0, s_traceEyeH = 0;
@@ -542,11 +543,31 @@ GESVR_GuideDot g_GESVR_Guide[2][kGESVRGuideMax];
             const LONG t = (h / 400 > 1) ? h / 400 : 1;   // ~2-3 px at 1024
             const LONG gap = h / 40;                      // clear centre
             const D3DCOLOR black = D3DCOLOR_ARGB(255, 0, 0, 0);
-            const RECT lines[4] = {
-                { 0, h / 2 - t, w / 2 - gap, h / 2 + t }, { w / 2 + gap, h / 2 - t, w, h / 2 + t },
-                { w / 2 - t, 0, w / 2 + t, h / 2 - gap }, { w / 2 - t, h / 2 + gap, w / 2 + t, h } };
-            for (const RECT &r : lines)
-                m_device->ColorFill(m_scope, &r, black);
+            // The picture is level with the head (VR::UpdateGunAim); the cross
+            // follows the gun, so it is drawn along the gun's up and right as
+            // seen in this picture. Built from t x t fills, one per t pixels
+            // along each arm -- about 1000 small fills a frame, scoped only.
+            const float cxf = 0.5f * (float)w, cyf = 0.5f * (float)h;
+            const float dirs[2][2] = { { g_GESVR_ScopeCross[0], g_GESVR_ScopeCross[1] },
+                                       { g_GESVR_ScopeCross[2], g_GESVR_ScopeCross[3] } };
+            for (const auto &d : dirs)
+            {
+                const float len = sqrtf(d[0] * d[0] + d[1] * d[1]);
+                if (len < 0.01f)
+                    continue;
+                const float ux = d[0] / len, uy = d[1] / len;
+                for (LONG k = gap; k < w / 2; k += t)
+                {
+                    for (int side = -1; side <= 1; side += 2)
+                    {
+                        const LONG px = (LONG)(cxf + side * ux * (float)k), py = (LONG)(cyf + side * uy * (float)k);
+                        RECT r = { px - t / 2, py - t / 2, px - t / 2 + t, py - t / 2 + t };
+                        if (r.left < 0 || r.top < 0 || r.right > w || r.bottom > h)
+                            continue;
+                        m_device->ColorFill(m_scope, &r, black);
+                    }
+                }
+            }
             const RECT dot = { w / 2 - t, h / 2 - t, w / 2 + t, h / 2 + t };
             m_device->ColorFill(m_scope, &dot, D3DCOLOR_ARGB(255, 255, 40, 40));
             return D3D_OK;
