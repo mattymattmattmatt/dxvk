@@ -33,6 +33,8 @@ bool  g_GESVR_ScopeValid[2] = { false, false };
 float g_GESVR_ScopeU[2] = { 0.5f, 0.5f };
 float g_GESVR_ScopeV[2] = { 0.5f, 0.5f };
 float g_GESVR_ScopeR[2] = { 0.0f, 0.0f };
+float g_GESVR_ScopeA[2][2] = { { 0.0f, 0.0f }, { 0.0f, 0.0f } };
+float g_GESVR_ScopeB[2][2] = { { 0.0f, 0.0f }, { 0.0f, 0.0f } };
 
 namespace {
     unsigned s_traceEyeW = 0, s_traceEyeH = 0;
@@ -882,41 +884,68 @@ GESVR_GuideDot g_GESVR_Guide[2][kGESVRGuideMax];
                 }
             }
 
-            // The sniper scope lens: the scope view copied into the square around
-            // the lens, then everything outside the circle painted black -- the
-            // scope's tube -- with a thin black rim. Drawn after the reticle so
-            // the dot never shows over the glass. VR::UpdateGunAim places it.
+            // The sniper scope lens: a disc across the end of the scope, square
+            // to the barrel, so it projects to an ellipse (centre + s*A + t*B,
+            // s^2 + t^2 <= 1; see VR::UpdateGunAim). Filled one screen row at a
+            // time, each row a StretchRect from the matching strip of the scope
+            // view, so only the glass is drawn and the gun and world around it
+            // stay. Drawn after the reticle so the dot never shows on the glass.
             {
                 const int si = (eye == 0) ? 0 : 1;
-                D3DSURFACE_DESC sd{};
-                if (g_GESVR_ScopeActive && g_GESVR_ScopeValid[si] && m_scope && SUCCEEDED(dest->GetDesc(&sd)))
+                D3DSURFACE_DESC sd{}, td{};
+                if (g_GESVR_ScopeActive && g_GESVR_ScopeValid[si] && m_scope && SUCCEEDED(dest->GetDesc(&sd))
+                    && SUCCEEDED(m_scope->GetDesc(&td)))
                 {
-                    const float sar = GESVR_RoundFactor(sd.Width, sd.Height);
-                    const float r = g_GESVR_ScopeR[si] * (float)sd.Height;
-                    const LONG cx = (LONG)(g_GESVR_ScopeU[si] * (float)sd.Width);
-                    const LONG cy = (LONG)(g_GESVR_ScopeV[si] * (float)sd.Height);
-                    const LONG ry = (LONG)(r + 0.5f), rx = (LONG)(r * sar + 0.5f);
-                    RECT box = { cx - rx, cy - ry, cx + rx, cy + ry };
-                    if (ry >= 4 && box.left >= 0 && box.top >= 0 && box.right <= (LONG)sd.Width && box.bottom <= (LONG)sd.Height
-                        && SUCCEEDED(m_device->StretchRect(m_scope, nullptr, dest, &box, D3DTEXF_LINEAR)))
+                    const float W = (float)sd.Width, H = (float)sd.Height;
+                    const float cx = g_GESVR_ScopeU[si] * W, cy = g_GESVR_ScopeV[si] * H;
+                    const float ax = g_GESVR_ScopeA[si][0] * W, ay = g_GESVR_ScopeA[si][1] * H;
+                    const float bx = g_GESVR_ScopeB[si][0] * W, by = g_GESVR_ScopeB[si][1] * H;
+                    const float det = ax * by - bx * ay;
+                    const float halfH = sqrtf(ay * ay + by * by);
+                    if (fabsf(det) > 4.0f && halfH >= 2.0f && halfH < H)
                     {
-                        const D3DCOLOR black = D3DCOLOR_ARGB(255, 0, 0, 0);
-                        const float glass = r * 0.94f;          // rim = the outer 6%
-                        for (LONG dy = -ry; dy < ry; ++dy)
+                        // s and t along a row: s = s1*X + s0, t = t1*X + t0, X = x - cx.
+                        const float s1 = by / det, t1 = -ay / det;
+                        const float TW = (float)td.Width, TH = (float)td.Height;
+                        const LONG y0 = std::max<LONG>(0, (LONG)floorf(cy - halfH));
+                        const LONG y1 = std::min<LONG>((LONG)sd.Height, (LONG)ceilf(cy + halfH));
+                        for (LONG y = y0; y < y1; ++y)
                         {
-                            const float ny = ((float)dy + 0.5f) / glass;
-                            const float in = 1.0f - ny * ny;
-                            const LONG hw = in > 0.0f ? (LONG)(glass * sar * sqrtf(in) + 0.5f) : 0;
-                            if (hw <= 0)
-                            {
-                                RECT row = { box.left, cy + dy, box.right, cy + dy + 1 };
-                                m_device->ColorFill(dest, &row, black);
+                            const float dy = (float)y + 0.5f - cy;
+                            const float s0 = -bx * dy / det, t0 = ax * dy / det;
+                            const float qa = s1 * s1 + t1 * t1;
+                            const float qb = 2.0f * (s1 * s0 + t1 * t0);
+                            const float qc = s0 * s0 + t0 * t0 - 1.0f;
+                            const float disc = qb * qb - 4.0f * qa * qc;
+                            if (qa <= 0.0f || disc <= 0.0f)
                                 continue;
-                            }
-                            RECT l = { box.left, cy + dy, cx - hw, cy + dy + 1 };
-                            RECT rr = { cx + hw, cy + dy, box.right, cy + dy + 1 };
-                            if (l.right > l.left) m_device->ColorFill(dest, &l, black);
-                            if (rr.right > rr.left) m_device->ColorFill(dest, &rr, black);
+                            const float root = sqrtf(disc);
+                            float X0 = (-qb - root) / (2.0f * qa), X1 = (-qb + root) / (2.0f * qa);
+                            LONG x0 = (LONG)ceilf(cx + X0), x1 = (LONG)floorf(cx + X1);
+                            x0 = std::max<LONG>(x0, 0);
+                            x1 = std::min<LONG>(x1, (LONG)sd.Width);
+                            if (x1 - x0 < 1)
+                                continue;
+                            // Texture at the two ends of the row's span.
+                            const float Xa = (float)x0 + 0.5f - cx, Xb = (float)x1 - 0.5f - cx;
+                            const float ua = 0.5f + 0.5f * (s1 * Xa + s0), ub = 0.5f + 0.5f * (s1 * Xb + s0);
+                            const float va = 0.5f - 0.5f * (t1 * Xa + t0), vb = 0.5f - 0.5f * (t1 * Xb + t0);
+                            if (ub <= ua)
+                                continue;                     // seen from the front of the lens
+                            RECT src = { (LONG)(std::clamp(ua, 0.0f, 1.0f) * TW), 0,
+                                         (LONG)(std::clamp(ub, 0.0f, 1.0f) * TW), 0 };
+                            src.top = std::min<LONG>((LONG)(std::clamp(0.5f * (va + vb), 0.0f, 1.0f) * TH), (LONG)td.Height - 1);
+                            src.bottom = src.top + 1;
+                            if (src.right <= src.left)
+                                src.right = src.left + 1;
+                            RECT dst = { x0, y, x1, y + 1 };
+                            m_device->StretchRect(m_scope, &src, dest, &dst, D3DTEXF_LINEAR);
+                            // A thin dark edge where the glass meets the tube.
+                            const D3DCOLOR edge = D3DCOLOR_ARGB(255, 8, 8, 8);
+                            RECT l = { x0, y, std::min(x0 + 2, x1), y + 1 };
+                            RECT r = { std::max(x1 - 2, x0), y, x1, y + 1 };
+                            m_device->ColorFill(dest, &l, edge);
+                            m_device->ColorFill(dest, &r, edge);
                         }
                     }
                 }
