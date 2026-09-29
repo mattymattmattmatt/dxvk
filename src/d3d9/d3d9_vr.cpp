@@ -28,6 +28,11 @@ namespace dxvk {
 int  g_GESVR_EyePass = 0;
 bool g_GESVR_EyeTrace = false;
 bool g_GESVR_DiagForceUpload = false;
+bool  g_GESVR_ScopeActive = false;
+bool  g_GESVR_ScopeValid[2] = { false, false };
+float g_GESVR_ScopeU[2] = { 0.5f, 0.5f };
+float g_GESVR_ScopeV[2] = { 0.5f, 0.5f };
+float g_GESVR_ScopeR[2] = { 0.0f, 0.0f };
 
 namespace {
     unsigned s_traceEyeW = 0, s_traceEyeH = 0;
@@ -513,6 +518,38 @@ GESVR_GuideDot g_GESVR_Guide[2][kGESVRGuideMax];
         // idle, and waiting for the GPU from inside PresentEx is the shape of
         // every deadlock this mod has had. The caller stops submitting these
         // several frames before calling, which covers the compositor.
+        // The sniper scope's view: copy the current render target (the scope
+        // pass just drew it) and cross it with a thin black crosshair. The eye
+        // captures then paint it into the lens.
+        HRESULT STDMETHODCALLTYPE CaptureScopeRT()
+        {
+            IDirect3DSurface9 *src = nullptr;
+            HRESULT hr = m_device->GetRenderTarget(0, &src);
+            if (FAILED(hr) || !src)
+                return FAILED(hr) ? hr : E_FAIL;
+            D3DSURFACE_DESC sd{};
+            src->GetDesc(&sd);
+            if (!m_scope)
+                hr = m_device->CreateRenderTarget(sd.Width, sd.Height, sd.Format, D3DMULTISAMPLE_NONE, 0, FALSE, &m_scope, nullptr);
+            if (SUCCEEDED(hr))
+                hr = m_device->StretchRect(src, nullptr, m_scope, nullptr, D3DTEXF_NONE);
+            src->Release();
+            if (FAILED(hr))
+                return hr;
+            const LONG w = (LONG)sd.Width, h = (LONG)sd.Height;
+            const LONG t = (h / 400 > 1) ? h / 400 : 1;   // ~2-3 px at 1024
+            const LONG gap = h / 40;                      // clear centre
+            const D3DCOLOR black = D3DCOLOR_ARGB(255, 0, 0, 0);
+            const RECT lines[4] = {
+                { 0, h / 2 - t, w / 2 - gap, h / 2 + t }, { w / 2 + gap, h / 2 - t, w, h / 2 + t },
+                { w / 2 - t, 0, w / 2 + t, h / 2 - gap }, { w / 2 - t, h / 2 + gap, w / 2 + t, h } };
+            for (const RECT &r : lines)
+                m_device->ColorFill(m_scope, &r, black);
+            const RECT dot = { w / 2 - t, h / 2 - t, w / 2 + t, h / 2 + t };
+            m_device->ColorFill(m_scope, &dot, D3DCOLOR_ARGB(255, 255, 40, 40));
+            return D3D_OK;
+        }
+
         HRESULT STDMETHODCALLTYPE ReleaseEyeSurfaces()
         {
             if (!m_left && !m_right && !m_sbs)
@@ -522,6 +559,7 @@ GESVR_GuideDot g_GESVR_Guide[2][kGESVRGuideMax];
             if (m_left)  { m_left->Release();  m_left = nullptr; }
             if (m_right) { m_right->Release(); m_right = nullptr; }
             if (m_sbs)   { m_sbs->Release();   m_sbs = nullptr; }
+            if (m_scope) { m_scope->Release(); m_scope = nullptr; }
             m_eyeW = m_eyeH = 0;
             m_sbsW = m_sbsH = 0;      // so the size check rebuilds them
             Game::logMsg("Stereo D3D RTs released (were %ux%u)", w, h);
@@ -540,9 +578,9 @@ GESVR_GuideDot g_GESVR_Guide[2][kGESVRGuideMax];
             // after the HUD pass when called from the end of dRenderView.
             IDirect3DSurface9 *bbNow = nullptr;
             m_device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bbNow);
-            IDirect3DSurface9 *src[4] = { m_left, m_right, m_overlay, bbNow };
-            HRESULT res[4] = { E_FAIL, E_FAIL, E_FAIL, E_FAIL };
-            for (int e = 0; e < 4; ++e)
+            IDirect3DSurface9 *src[5] = { m_left, m_right, m_overlay, bbNow, m_scope };
+            HRESULT res[5] = { E_FAIL, E_FAIL, E_FAIL, E_FAIL, E_FAIL };
+            for (int e = 0; e < 5; ++e)
             {
                 if (m_diagRT[e])  { m_diagRT[e]->Release();  m_diagRT[e] = nullptr; }
                 if (m_diagMem[e]) { m_diagMem[e]->Release(); m_diagMem[e] = nullptr; }
@@ -576,8 +614,8 @@ GESVR_GuideDot g_GESVR_Guide[2][kGESVRGuideMax];
 
         HRESULT STDMETHODCALLTYPE DiagEyeDumpWrite(const char *pathPrefix)
         {
-            static const char *kSide[4] = { "L", "R", "O", "B" };
-            for (int e = 0; e < 4; ++e)
+            static const char *kSide[5] = { "L", "R", "O", "B", "S" };
+            for (int e = 0; e < 5; ++e)
             {
                 if (!m_diagMem[e])
                     continue;
@@ -840,6 +878,46 @@ GESVR_GuideDot g_GESVR_Guide[2][kGESVRGuideMax];
                         m_device->ColorFill(dest, &vr2, col);
                         break;
                     }
+                    }
+                }
+            }
+
+            // The sniper scope lens: the scope view copied into the square around
+            // the lens, then everything outside the circle painted black -- the
+            // scope's tube -- with a thin black rim. Drawn after the reticle so
+            // the dot never shows over the glass. VR::UpdateGunAim places it.
+            {
+                const int si = (eye == 0) ? 0 : 1;
+                D3DSURFACE_DESC sd{};
+                if (g_GESVR_ScopeActive && g_GESVR_ScopeValid[si] && m_scope && SUCCEEDED(dest->GetDesc(&sd)))
+                {
+                    const float sar = GESVR_RoundFactor(sd.Width, sd.Height);
+                    const float r = g_GESVR_ScopeR[si] * (float)sd.Height;
+                    const LONG cx = (LONG)(g_GESVR_ScopeU[si] * (float)sd.Width);
+                    const LONG cy = (LONG)(g_GESVR_ScopeV[si] * (float)sd.Height);
+                    const LONG ry = (LONG)(r + 0.5f), rx = (LONG)(r * sar + 0.5f);
+                    RECT box = { cx - rx, cy - ry, cx + rx, cy + ry };
+                    if (ry >= 4 && box.left >= 0 && box.top >= 0 && box.right <= (LONG)sd.Width && box.bottom <= (LONG)sd.Height
+                        && SUCCEEDED(m_device->StretchRect(m_scope, nullptr, dest, &box, D3DTEXF_LINEAR)))
+                    {
+                        const D3DCOLOR black = D3DCOLOR_ARGB(255, 0, 0, 0);
+                        const float glass = r * 0.94f;          // rim = the outer 6%
+                        for (LONG dy = -ry; dy < ry; ++dy)
+                        {
+                            const float ny = ((float)dy + 0.5f) / glass;
+                            const float in = 1.0f - ny * ny;
+                            const LONG hw = in > 0.0f ? (LONG)(glass * sar * sqrtf(in) + 0.5f) : 0;
+                            if (hw <= 0)
+                            {
+                                RECT row = { box.left, cy + dy, box.right, cy + dy + 1 };
+                                m_device->ColorFill(dest, &row, black);
+                                continue;
+                            }
+                            RECT l = { box.left, cy + dy, cx - hw, cy + dy + 1 };
+                            RECT rr = { cx + hw, cy + dy, box.right, cy + dy + 1 };
+                            if (l.right > l.left) m_device->ColorFill(dest, &l, black);
+                            if (rr.right > rr.left) m_device->ColorFill(dest, &rr, black);
+                        }
                     }
                 }
             }
@@ -1314,8 +1392,9 @@ GESVR_GuideDot g_GESVR_Guide[2][kGESVRGuideMax];
         IDirect3DSurface9 *m_black = nullptr;
         IDirect3DSurface9 *m_overlay = nullptr;
         IDirect3DSurface9 *m_sbs = nullptr;
-        IDirect3DSurface9 *m_diagRT[4] = { nullptr, nullptr, nullptr, nullptr };    // DiagEyeDump only
-        IDirect3DSurface9 *m_diagMem[4] = { nullptr, nullptr, nullptr, nullptr };
+        IDirect3DSurface9 *m_scope = nullptr;     // sniper scope view, see CaptureScopeRT
+        IDirect3DSurface9 *m_diagRT[5] = { nullptr, nullptr, nullptr, nullptr, nullptr };    // DiagEyeDump only
+        IDirect3DSurface9 *m_diagMem[5] = { nullptr, nullptr, nullptr, nullptr, nullptr };
         IDirect3DStateBlock9 *m_alphaSB = nullptr;
         bool m_alphaSBFailed = false;
         UINT m_eyeW = 0;
