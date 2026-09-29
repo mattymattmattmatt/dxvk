@@ -37,6 +37,7 @@ namespace dxvk {
   // mod-facing vr_eyediag.h.
   void GESVR_TraceRecord(const char *what, const void *caller, bool isDraw,
                          uint32_t rtW, uint32_t rtH, const D3DVIEWPORT9 &vp, const RECT &sc, bool scOn);
+  static void GESVR_DropTitleCopy();
 }
 
 // One load and one branch outside a traced eye pass.
@@ -384,6 +385,7 @@ namespace dxvk {
       GESVR_LogWithStack(text, _ReturnAddress());
     }
 
+    GESVR_DropTitleCopy();
     HRESULT hr = ResetSwapChain(pPresentationParameters, nullptr);
     if (FAILED(hr))
       return hr;
@@ -1854,6 +1856,63 @@ namespace dxvk {
   // straight from the vertices. VGUI draws screen-space quads with the colour
   // in the vertex, so this tells a black cover from an image drawn invisible.
   // Only directly-mapped (dynamic) buffers, which is what VGUI draws from.
+  // GESVR: the main-menu title picture (materials/console/background01_widescreen,
+  // 2048x1024 DXT1, drawn full screen onto the backbuffer) comes out black once
+  // a map has been played, although texture, UVs, shader and constants all
+  // trace identical to the good draw at startup. So the first time it is drawn
+  // -- at startup, where it is right -- the result is kept, and every later
+  // draw of it is overwritten with that copy. The draw is opaque and covers
+  // the whole backbuffer, so the copy is exactly what a working draw gives.
+  static IDirect3DSurface9* g_GESVR_TitleCopy = nullptr;
+
+  static void GESVR_DropTitleCopy() {
+    if (g_GESVR_TitleCopy) {
+      g_GESVR_TitleCopy->Release();
+      g_GESVR_TitleCopy = nullptr;
+    }
+  }
+
+  void D3D9DeviceEx::GESVR_AfterDraw() {
+    D3D9CommonTexture* tex = GetCommonTexture(m_state.textures[0]);
+    if (likely(!tex || tex->Desc()->Width != 2048 || tex->Desc()->Height != 1024
+               || tex->Desc()->Format != D3D9Format::DXT1 || m_state.renderTargets[0] == nullptr))
+      return;
+    IDirect3DSurface9* rt = m_state.renderTargets[0].ptr();
+    Com<IDirect3DSurface9> bb;
+    if (FAILED(m_implicitSwapchain->GetBackBuffer(0, D3DBACKBUFFER_TYPE_MONO, &bb)) || bb.ptr() != rt)
+      return;
+    D3DSURFACE_DESC desc;
+    if (FAILED(rt->GetDesc(&desc)))
+      return;
+    // The whole screen, or it is some other use of a texture that size.
+    if (m_state.viewport.X != 0 || m_state.viewport.Y != 0
+        || m_state.viewport.Width != desc.Width || m_state.viewport.Height != desc.Height)
+      return;
+
+    if (g_GESVR_TitleCopy) {
+      D3DSURFACE_DESC have;
+      g_GESVR_TitleCopy->GetDesc(&have);
+      if (have.Width != desc.Width || have.Height != desc.Height || have.Format != desc.Format
+          || have.MultiSampleType != desc.MultiSampleType)
+        GESVR_DropTitleCopy();
+    }
+    // Same size, format and anti-aliasing as the backbuffer (the reset after
+    // the first frames turns MSAA on), so both copies are plain image copies.
+    if (!g_GESVR_TitleCopy) {
+      if (FAILED(CreateRenderTarget(desc.Width, desc.Height, desc.Format, desc.MultiSampleType, desc.MultiSampleQuality,
+                                    FALSE, &g_GESVR_TitleCopy, nullptr)))
+        return;
+      StretchRect(rt, nullptr, g_GESVR_TitleCopy, nullptr, D3DTEXF_NONE);
+      char text[128];
+      snprintf(text, sizeof(text), "DXVK: kept the menu title picture (%ux%u) to redraw after maps",
+               desc.Width, desc.Height);
+      GESVR_LogWithStack(text, _ReturnAddress());
+      return;
+    }
+    StretchRect(g_GESVR_TitleCopy, nullptr, rt, nullptr, D3DTEXF_NONE);
+  }
+
+
   void D3D9DeviceEx::GESVR_TraceMenuVerts(INT baseVertex, UINT minVertex, UINT numVertices) {
     if (m_state.vertexDecl == nullptr)
       return;
@@ -2770,6 +2829,7 @@ namespace dxvk {
         cBaseVertexIndex, 0);
     });
 
+    GESVR_AfterDraw();
     return D3D_OK;
   }
 

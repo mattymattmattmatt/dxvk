@@ -900,6 +900,7 @@ namespace dxvk {
     // GESVR eye-pass tracing (L4D2VR/vr_eyediag.h).
     void GESVR_TraceState(const char *what, const void *caller, bool isDraw);
     void GESVR_TraceMenuVerts(INT baseVertex, UINT minVertex, UINT numVertices);
+    void GESVR_AfterDraw();
 
     bool ChangeReportedMemory(int64_t delta) {
       if (IsExtended())
