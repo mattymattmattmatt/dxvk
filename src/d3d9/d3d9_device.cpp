@@ -1877,6 +1877,27 @@ namespace dxvk {
     if (likely(!tex || tex->Desc()->Width != 2048 || tex->Desc()->Height != 1024
                || tex->Desc()->Format != D3D9Format::DXT1 || m_state.renderTargets[0] == nullptr))
       return;
+    // Map loading pictures are the same size and format, so the title is told
+    // apart by its contents: a hash of the start of its CPU copy, taken the
+    // first time (at startup, where the title is the only such draw). Only
+    // draws of that same picture are replaced -- otherwise the loading screen
+    // came out as the title with the loading text over it (Matty, 2026-09-30).
+    static uint64_t s_titleHash = 0;
+    uint64_t hash = 1469598103934665603ull;
+    {
+      const DxvkBufferSliceHandle slice = tex->GetMappedSlice(0);
+      if (!slice.mapPtr || slice.length < 4096)
+        return;
+      const uint8_t* d = reinterpret_cast<const uint8_t*>(slice.mapPtr);
+      const size_t n = size_t(std::min<VkDeviceSize>(slice.length, 65536));
+      for (size_t i = 0; i < n; i++)
+        hash = (hash ^ d[i]) * 1099511628211ull;
+    }
+    if (s_titleHash == 0)
+      s_titleHash = hash;
+    else if (hash != s_titleHash)
+      return;
+
     IDirect3DSurface9* rt = m_state.renderTargets[0].ptr();
     Com<IDirect3DSurface9> bb;
     if (FAILED(m_implicitSwapchain->GetBackBuffer(0, D3DBACKBUFFER_TYPE_MONO, &bb)) || bb.ptr() != rt)
