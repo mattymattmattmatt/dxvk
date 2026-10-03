@@ -1872,7 +1872,50 @@ namespace dxvk {
     }
   }
 
-  void D3D9DeviceEx::GESVR_AfterDraw() {
+  // The screen-space box of an indexed draw's vertices (VGUI draws in pixels),
+  // read from the CPU copy of the vertex buffer. False if it cannot be read.
+  bool D3D9DeviceEx::GESVR_DrawBounds(INT baseVertex, UINT minVertex, UINT numVertices, RECT& box, bool& opaqueWhite) {
+    if (m_state.vertexDecl == nullptr)
+      return false;
+    const D3DVERTEXELEMENT9 *pos = nullptr, *col = nullptr;
+    for (const auto& e : m_state.vertexDecl->GetElements()) {
+      if (e.Usage == D3DDECLUSAGE_POSITION && e.UsageIndex == 0 && !pos) pos = &e;
+      if (e.Usage == D3DDECLUSAGE_COLOR && e.UsageIndex == 0 && !col) col = &e;
+    }
+    if (!pos || pos->Type != D3DDECLTYPE_FLOAT3)
+      return false;
+    opaqueWhite = true;
+    const D3D9VBO& vbo = m_state.vertexBuffers[pos->Stream];
+    D3D9CommonBuffer* buf = GetCommonBuffer(vbo.vertexBuffer);
+    if (!buf || buf->GetMapMode() != D3D9_COMMON_BUFFER_MAP_MODE_DIRECT || !vbo.stride)
+      return false;
+    const uint8_t* data = reinterpret_cast<const uint8_t*>(buf->GetMappedSlice().mapPtr);
+    if (!data)
+      return false;
+    const VkDeviceSize size = buf->Desc()->Size;
+    float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+    const UINT n = std::min(numVertices, 256u);
+    UINT read = 0;
+    for (UINT i = 0; i < n; i++) {
+      const VkDeviceSize at = VkDeviceSize(vbo.offset) + VkDeviceSize(baseVertex + INT(minVertex + i)) * vbo.stride;
+      if (at + vbo.stride > size)
+        break;
+      const float* p = reinterpret_cast<const float*>(data + at + pos->Offset);
+      x0 = std::min(x0, p[0]); x1 = std::max(x1, p[0]);
+      y0 = std::min(y0, p[1]); y1 = std::max(y1, p[1]);
+      if (col && col->Stream == pos->Stream
+          && *reinterpret_cast<const uint32_t*>(data + at + col->Offset) != 0xFFFFFFFFu)
+        opaqueWhite = false;
+      read++;
+    }
+    if (read < 3 || !(x1 > x0) || !(y1 > y0) || x0 < -8192.0f || x1 > 16384.0f || y0 < -8192.0f || y1 > 16384.0f)
+      return false;
+    box.left = LONG(std::floor(x0 + 0.5f)); box.right  = LONG(std::floor(x1 + 0.5f));
+    box.top  = LONG(std::floor(y0 + 0.5f)); box.bottom = LONG(std::floor(y1 + 0.5f));
+    return true;
+  }
+
+  void D3D9DeviceEx::GESVR_AfterDraw(INT baseVertex, UINT minVertex, UINT numVertices) {
     D3D9CommonTexture* tex = GetCommonTexture(m_state.textures[0]);
     if (likely(!tex || tex->Desc()->Width != 2048 || tex->Desc()->Height != 1024
                || tex->Desc()->Format != D3D9Format::DXT1 || m_state.renderTargets[0] == nullptr))
@@ -1910,6 +1953,29 @@ namespace dxvk {
         || m_state.viewport.Width != desc.Width || m_state.viewport.Height != desc.Height)
       return;
 
+    // Where this draw lands. The game also redraws PARTS of the title in a
+    // frame -- the patch behind a dialog or an open dropdown, clipped in
+    // software to that panel -- and pasting the whole picture then wiped what
+    // had already been drawn (the Create Server dialog vanished under its own
+    // dropdown; Matty, 2026-10-03). So only the drawn box is replaced, and
+    // only a draw of the whole screen is ever kept as the copy.
+    // A draw that is tinted or see-through (a fading panel's backdrop) is the
+    // game blending the picture in; a solid paste there showed a hard-edged
+    // patch of title over the map loading screen. Those are left alone.
+    RECT box;
+    bool opaqueWhite = false;
+    if (!GESVR_DrawBounds(baseVertex, minVertex, numVertices, box, opaqueWhite) || !opaqueWhite)
+      return;
+    box.left = std::max<LONG>(box.left, 0);              box.top = std::max<LONG>(box.top, 0);
+    box.right = std::min<LONG>(box.right, desc.Width);   box.bottom = std::min<LONG>(box.bottom, desc.Height);
+    if (m_state.renderStates[D3DRS_SCISSORTESTENABLE]) {
+      box.left = std::max(box.left, m_state.scissorRect.left);     box.top = std::max(box.top, m_state.scissorRect.top);
+      box.right = std::min(box.right, m_state.scissorRect.right);  box.bottom = std::min(box.bottom, m_state.scissorRect.bottom);
+    }
+    if (box.right <= box.left || box.bottom <= box.top)
+      return;
+    const bool whole = box.left == 0 && box.top == 0 && box.right == LONG(desc.Width) && box.bottom == LONG(desc.Height);
+
     if (g_GESVR_TitleCopy) {
       D3DSURFACE_DESC have;
       g_GESVR_TitleCopy->GetDesc(&have);
@@ -1920,6 +1986,8 @@ namespace dxvk {
     // Same size, format and anti-aliasing as the backbuffer (the reset after
     // the first frames turns MSAA on), so both copies are plain image copies.
     if (!g_GESVR_TitleCopy) {
+      if (!whole)
+        return;
       if (FAILED(CreateRenderTarget(desc.Width, desc.Height, desc.Format, desc.MultiSampleType, desc.MultiSampleQuality,
                                     FALSE, &g_GESVR_TitleCopy, nullptr)))
         return;
@@ -1930,7 +1998,10 @@ namespace dxvk {
       GESVR_LogWithStack(text, _ReturnAddress());
       return;
     }
-    StretchRect(g_GESVR_TitleCopy, nullptr, rt, nullptr, D3DTEXF_NONE);
+    if (whole)
+      StretchRect(g_GESVR_TitleCopy, nullptr, rt, nullptr, D3DTEXF_NONE);
+    else
+      StretchRect(g_GESVR_TitleCopy, &box, rt, &box, D3DTEXF_NONE);
   }
 
 
@@ -2850,7 +2921,7 @@ namespace dxvk {
         cBaseVertexIndex, 0);
     });
 
-    GESVR_AfterDraw();
+    GESVR_AfterDraw(BaseVertexIndex, MinVertexIndex, NumVertices);
     return D3D_OK;
   }
 
